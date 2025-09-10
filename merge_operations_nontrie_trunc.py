@@ -21,6 +21,7 @@ from math import ceil, log2
 from typing import Dict, List
 
 # ────────────────────────── bit utils ──────────────────────────
+vb = False
 
 def _bytes_to_bits(b: bytes) -> str:
     return "".join(f"{x:08b}" for x in b)
@@ -96,8 +97,7 @@ def _write_subtree(node: Node, parent: int, depth: int, L: int, out_bits: List[s
         return
     left_cnt = node.kids.get("0", Node()).cnt
     right_cnt = parent - left_cnt
-    print("write_subtree().d,left,right =", depth, left_cnt, right_cnt)
-    #out_bits.append(f"{left_cnt:0{_w_cnt(parent)}b}")
+    print("write_subtree().d,left,right =", depth, left_cnt, right_cnt) if vb else None
     if depth < L:
         left_bit = 1 if left_cnt > 0 else 0
         right_bit = 1 if right_cnt > 0 else 0
@@ -109,7 +109,6 @@ def _write_subtree(node: Node, parent: int, depth: int, L: int, out_bits: List[s
 
 def _read_subtree(buf: List[str], parent: int, depth: int, L: int) -> Node:
     n = Node(); n.cnt = parent; n._L = L
-    #print("read_sub().depth, L, parent, node =", depth, L, parent, n.cnt)
     if depth >= L or parent == 0:
         return n
     #left_cnt = _rd_u(buf, _w_cnt(parent))
@@ -118,7 +117,7 @@ def _read_subtree(buf: List[str], parent: int, depth: int, L: int) -> Node:
     if left_cnt < 0: left_cnt = 0
     if left_cnt > parent: left_cnt = parent
     #right_cnt = parent - left_cnt
-    print("read_subtree().parent=", parent, ", lcnt=", left_cnt, ", rcnt=",right_cnt)
+    print("read_subtree().parent=", parent, ", lcnt=", left_cnt, ", rcnt=",right_cnt) if vb else None
     if left_cnt > 0:
         n.kids["0"] = _read_subtree(buf, left_cnt, depth + 1, L)
     if right_cnt > 0:
@@ -149,7 +148,6 @@ def _max_balanced_prefix(root: Node, L: int) -> int:
         next_layer = []
         for n in layer:
             p = n.cnt
-            #print("max_bal().n =", n.cnt)
             #if (p & 1) != 0:  # odd => can't split evenly
             #    return s
             l = n.kids.get("0", Node()).cnt
@@ -314,11 +312,20 @@ def persist(data: bytes, L: int = None, f: float = 0.25, fn: str = "local_tree.b
     # L = ceil(f * sqrt(N_bits)) if not given
     if L is None:
         L = max(1, math.ceil(f * math.sqrt(max(1, N_bits))))
+    L1, dL   = math.ceil(N_bits / L) if L > 0 else 0, 0
 
     # Split into L-bit chunks (pad last chunk with zeros)
     bits = _bytes_to_bits(data)
-    print("persist().bits =", bits)
-    L1   = math.ceil(N_bits / L) if L > 0 else 0
+    if not L * L1 == len(bits):
+        print("persist().bits,L*L1 =", len(bits), L, L1, L*L1) if vb else None
+        for i in range(1,9):
+            if len(bits) % (L-i) == 0 or len(bits) % (L+i) == 0:
+                L = L-i if len(bits) % (L-i) == 0 else L+i
+                L1 = int(len(bits) / L)
+                print("persist().adjusted.bits,L*L1 =", len(bits), L, L1, L*L1) if vb else None
+                break
+    print("persist().bits =", bits) if vb else None
+
     sequence: List[str] = []
     for i in range(L1):
         chunk = bits[i*L:(i+1)*L]
@@ -332,15 +339,15 @@ def persist(data: bytes, L: int = None, f: float = 0.25, fn: str = "local_tree.b
     s_target = min(_tzcount(L1), L)
     # Verify actual tree is perfectly balanced up to s_target; otherwise disable trunc
     s_actual = _max_balanced_prefix(root, L)
-    TRUNC = 0 #1 if s_actual >= 0 else 0
+    TRUNC = s_actual if s_actual > 0 else 0
     s = s_actual if TRUNC else 0
-    print("persist().target,actual,trunc,s", s_target, s_actual, TRUNC, s)
+    print("persist().target,actual,trunc,s", s_target, s_actual, TRUNC, s) if vb else None
 
     # Serialize tree: if TRUNC, serialize from depth-s frontier (left→right)
     tree_bits_list: List[str] = []
-    if TRUNC:
+    if TRUNC>0:
         frontier = _frontier_at_depth(root, s)
-        print("persist().trunc,frontier =", TRUNC, len(frontier), " root.cnt=",root.cnt)
+        print("persist().trunc,frontier =", TRUNC, len(frontier), " root.cnt=",root.cnt) if vb else None
         for n in frontier:
             _write_subtree(n, n.cnt, s, L, tree_bits_list)
     else:
@@ -361,7 +368,7 @@ def persist(data: bytes, L: int = None, f: float = 0.25, fn: str = "local_tree.b
     for idx, ch in enumerate(sequence):
         per_leaf_rows[ch].append(idx)
     # ids := "stable positions" per leaf, in lexicographic leaf order
-    print("persist().leaf_expts =", leaves_expts, "\n leaves_cnts=", leaves_cnts, "\n per_leaf_rows=", per_leaf_rows)
+    print("persist().leaf_expts =", leaves_expts, "\n leaves_cnts=", leaves_cnts, "\n per_leaf_rows=", per_leaf_rows) if vb else None
     for leaf, cnt in leaves_cnts:
         for _row in per_leaf_rows[leaf]:
             ids.append(seq.index(leaf))
@@ -369,7 +376,7 @@ def persist(data: bytes, L: int = None, f: float = 0.25, fn: str = "local_tree.b
 
     # Variable-width pack: w_i = ceil(log2(i)) for i=1..L1, store id_i truncated to w_i bits (id_1=0)
     hbits_list: List[str] = []
-    print("persist().ids =", ids)
+    print("persist().ids =", ids) if vb else None
     for i, val in enumerate(ids):
         i = len(ids)-i
         w = 0 if i <= 1 else math.ceil(math.log2(i))
@@ -377,10 +384,10 @@ def persist(data: bytes, L: int = None, f: float = 0.25, fn: str = "local_tree.b
             # Truncate higher bits if val >= 2^w (to match the reading schedule)
             #hbits_list.append(f"{(val & ((1<<w)-1)):0{w}b}")
             hbits_list.append(f"{val:0{w}b}")
-            print("persist().id,w =", val, w)
+            print("persist().id,w =", val, w) if vb else None
     hbits = "".join(hbits_list)
     HBITS_LEN = len(hbits)
-    print("persist().tree_bits =", tree_bits, "\n hbits=", hbits)
+    print("persist().tree_bits =", tree_bits, "\n hbits=", hbits) if vb else None
 
     max_c = max([c for _,c in leaves_expts]) if len(leaves_expts) else 0
     exc_bits = "".join([f"{l}{c:0{max_c}b}" for l,c in leaves_expts])
@@ -390,7 +397,7 @@ def persist(data: bytes, L: int = None, f: float = 0.25, fn: str = "local_tree.b
         f"{L:016b}"
         f"{N_bytes:032b}"
         f"{L1:032b}"
-        f"{TRUNC:01b}"
+        f"{TRUNC:04b}"
         f"{tree_bits_len:032b}"
         f"{HBITS_LEN:032b}"
         f"{len(exc_bits):032b}"
@@ -425,7 +432,7 @@ def load(fn: str) -> bytes:
     L       = _rd_u(buf, 16)
     N_bytes = _rd_u(buf, 32)
     L1      = _rd_u(buf, 32)
-    TRUNC   = _rd_u(buf, 1)
+    TRUNC   = int(_rd_u(buf, 4))
     tree_bits_len = _rd_u(buf, 32)
     HBITS_LEN     = _rd_u(buf, 32)
     EBITS_LEN     = _rd_u(buf, 32)
@@ -436,14 +443,14 @@ def load(fn: str) -> bytes:
     tbuf = [tree_bits]
 
     # Read tree with/without truncated prefix
-    if TRUNC == 1:
-        s = min(_tzcount(L1), L) # inference from L1 (validated at persist side)
+    if TRUNC > 0:
+        s = TRUNC #min(_tzcount(L1), L) # inference from L1 (validated at persist side)
         # Build balanced prefix of depth s
         root = _build_balanced_prefix(L1, s, L)
         # Attach subtrees from depth s frontier
         frontier = _frontier_at_depth(root, s)
         for n in frontier:
-            print("load().tree[0] =", tbuf[0][0:5])
+            print("load().tree[0] =", tbuf[0][0:5], ", s=", s) if vb else None
             # Read this subtree and graft it under n
             sub = _read_subtree(tbuf, n.cnt, s, L)
             n.kids = sub.kids  # counts already set; we keep n.cnt
@@ -460,7 +467,9 @@ def load(fn: str) -> bytes:
 
     # Read HBITS and decode variable-width ids
     hbits_bits = _rd_bits(buf, HBITS_LEN)
-    print("load().tree_bits =", tree_bits, "\n hbits=", hbits_bits)
+    print("load().tree_bits =", tree_bits, "\n hbits=", hbits_bits) if vb else None
+    L1 = int(N_bytes*8/L)
+    print("load().L,L1,N_bytes =", L, L1, N_bytes) if vb else None
     hbuf = [hbits_bits]
     ids = []
     pos = 0
@@ -474,7 +483,7 @@ def load(fn: str) -> bytes:
             if len(chunk) != w:
                 raise ValueError(f"hbits underflow at i={i}")
             ids.append(int(chunk, 2))
-            print("load().i,w,id =", i, w, ids[-1])
+            print("load().i,w,id =", i, w, ids[-1]) if vb else None
             pos += w
 
     # optional sanity: leftover bits in HBITS block?
@@ -508,31 +517,31 @@ def load(fn: str) -> bytes:
         pos -= 1 if cnt<= 1 else 0
     for i, leaf in enumerate(rows):
         per_leaf_rows[leaf].append(i)
-    print("load().rows=", rows, "\n per_leaf_rows =", per_leaf_rows)
+    print("load().leaf_expts =", leaf_exc) if vb else None
+    print("load().per_leaf_rows =", per_leaf_rows, ",\n leaves_cnts=", leaves_cnts, ",\n ids=", ids) if vb else None
+
     # Interpret ids as stable positions for a column-major NR=L1 layout:
     # original stream order is 0..L1-1; rows == indices.
     # Fill per-leaf queues by distributing occurrences in the same order as persist.
     # We will simply rebuild the original sequence by round-robin over rows (NR=L1),
     # pulling leaf labels from per-row FIFO queues.
     # Build per-leaf rows by walking leaves_cnts and using a working copy of ids
-    wid = 0
-    for leaf, cnt in leaves_cnts:
-        cnt += leaf_exc[leaf] if leaf in leaf_exc else 0
+    #wid = 0
+    #for leaf, cnt in leaves_cnts:
+    #    cnt += leaf_exc[leaf] if leaf in leaf_exc else 0
         # grab cnt ids (even if many are zero due to small w_i early)
-        chunk_ids = ids[wid:wid+cnt]
-        wid += cnt
+    #    chunk_ids = ids[wid:wid+cnt]
+    #    wid += cnt
         # map them back to rows (here they are already row indices modulo schedule truncation)
         #for v in chunk_ids:
         #    per_leaf_rows[leaf].append(v)
 
-    print("leaf_exc=", leaf_exc, "\n leaves_cnts=", leaves_cnts, "\n per_leaf_rows=", per_leaf_rows)
 
     # Build per-row queues of leaves using the order per_leaf_rows
-    NR = L1
-    queues: List[List[str]] = [[] for _ in range(NR)]
+    queues: List[List[str]] = [[] for _ in range(L1)]
     for leaf, rows in per_leaf_rows.items():
         for r in rows:
-            queues[r % NR].append(leaf)
+            queues[r % L1].append(leaf)
 
     # Column-major interleave rows (with NR=L1 ⇒ original order)
     chunks: List[str] = []
@@ -542,13 +551,15 @@ def load(fn: str) -> bytes:
         if queues[row]:
             chunks.append(queues[row].pop(0))
             remaining -= 1
-        row = (row + 1) % NR
+        row = (row + 1) % L1
 
     # Convert to bytes (trim to exact bit length)
     bitstream = "".join(chunks)[: N_bytes * 8]
+    print("load().bitstream =", len(bitstream), ", chunks =", len("".join(chunks))) if vb else None
     if not bitstream:
         return b""
     return int(bitstream, 2).to_bytes(len(bitstream)//8, "big")
+
 
 
 # ────────────────────────── tiny demo ──────────────────────────
