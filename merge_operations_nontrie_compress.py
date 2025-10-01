@@ -16,14 +16,56 @@
 #
 # Exact bit-accurate reconstruction preserved.
 
+
+import random
+import string
 import base64, math, sys, re, numpy as np
 import ollama, os, pickle, tiktoken
+import json
+from collections import defaultdict
+
+import tiktoken
 from math import ceil, floor, log2, sqrt
 from scipy.special import lambertw
 from typing import Dict, List
 
 # ────────────────────────── bit utils ──────────────────────────
-vb = True
+vb = False
+
+enc = tiktoken.get_encoding("cl100k_base")
+
+wtok_map = None
+
+def get_wchar_tokens(w = 2):
+    global wtok_map
+
+    if not wtok_map is None:
+        return wtok_map
+
+    # Get all token IDs in the vocabulary
+    token_ids = enc.encode_ordinary("")  # returns an empty list; use ._tokenizer instead
+
+    # The vocabulary is accessible via enc._decode_cache or enc._mergeable_ranks/enc._tokenizer (undocumented)
+    # Safest is to get the full list using private API
+    all_tokens = []
+    for tok in range(enc.n_vocab):
+      try:
+        decoded = enc.decode([tok])
+        all_tokens.append(decoded)
+      except KeyError:
+        # Token is invalid for decoding, skip it
+        continue
+
+    # Filter for exactly 2-character tokens
+    wchar_tokens = [tok for tok in all_tokens if len(tok) >= w]
+    wtok_map = {}
+    for tok in wchar_tokens:
+        if not tok[0] in wtok_map.keys():
+            wtok_map[tok[0]] = []
+        wtok_map[tok[0]].append(tok[1:])
+    print("get_wchar_tokens().keys,v.len =", len(wtok_map.keys()), sum([len(v) for k,v in wtok_map.items()])/len(wtok_map.keys())) if vb else None
+    return wtok_map
+
 
 def _bytes_to_bits(b: bytes) -> str:
     return "".join(f"{x:08b}" for x in b)
@@ -833,23 +875,54 @@ def encode_tokens(tokens):
     return b''.join([t.to_bytes(4, 'big') for t in tokens]).decode("utf-8", "replace")
 
 
+def is_alpha_numeric(b):
+    #return b > 96 and b < 123
+    return b > 47 and b < 58 or b > 64 and b < 91 or b > 96 and b < 123
+
+
+def is_printable(b):
+    return b > 31 and b < 127 or b >= 160
+
+
+def printable_idx(idx):
+    print("printable_idx.p =", floor(idx/95)*128 + 32 + (idx % 95), "idx=", idx) if vb else None
+    return floor(idx/95)*128 + 32 + (idx % 95)
+
+
+def token_idx(idx, key=None, key1=None, w=2):
+    tokmap = get_wchar_tokens(w=w)
+    print("token_idx().idx,len,k,k1,w =", idx, len(tokmap.keys()), key, key1, w) if vb else None
+    if key is None:
+        if idx >= len(tokmap.keys()):
+            key = list(tokmap.keys())[len(tokmap.keys())-1] 
+            return key # + token_idx(idx % len(tokmap.keys()), key)
+        return list(tokmap.keys())[idx]
+    if key1 is None:
+        if idx >= len(tokmap[key]):
+            return tokmap[key][-1][0]
+        return tokmap[key][idx][0]
+    else:
+        key1 = -1 if key1 >= len(tokmap[key]) else key1
+        if idx >= len(tokmap[key][key1]):
+            return tokmap[key][key1][-1]
+        return tokmap[key][key1][idx]
+
+
 def encode_str(bit_str):
     # Pad with zeros if needed
     pad = bit_str + "0" * ((8 - len(bit_str) % 8) % 8)
 
     # Group every 8 bits, convert to bytes
     byte_arr = bytearray(int(pad[i:i+8], 2) for i in range(0, len(pad), 8))
-    #print("encode_str().byte_arr =", byte_arr, ":", len(byte_arr))
-    #packed_str = base64.b64encode(byte_arr).decode('ascii')
     seen, a, non_print = set(), None, {}
     for b in byte_arr:
-        if b > 31 and b < 127 or b >= 160:
+        if is_alpha_numeric(b): # or is_printable(b)
             if not a is None:
                 seen.add(a + chr(b))
             a = chr(b)
     packed_str, a = "", ""
     for b in byte_arr:
-        if b > 31 and b < 127 or b >= 160:
+        if is_alpha_numeric(b): # or is_printable(b)
             packed_str += chr(b)
             a = chr(b)
         else:
@@ -857,45 +930,203 @@ def encode_str(bit_str):
                 packed_str += non_print[b] 
             else:
               for i in range(256):
-                if (i > 32 and i < 127 or i >= 160) and not a+chr(i) in seen:
+                if is_alpha_numeric(i) and not a+chr(i) in seen:
+                #if is_printable(i) and not a+chr(i) in seen:
                     a = "a" if len(a)==0 else a
                     packed_str += a+chr(i) 
                     non_print[b] = a+chr(i)
                     seen.add(a + chr(i))
                     break
-    #packed_str = bytes(byte_arr).decode('latin-1')
     print("encode_str().packed_str =", packed_str, ":", len(packed_str), ", non_print =", non_print, ":", len(non_print.keys())) if vb else None
-    return packed_str, {v:k for k,v in non_print.items()}
+    return packed_str, {v:k for k,v in non_print.items()}, 0
 
 
-def define_basis_prompt():
-    basis_txt = "What is the time today? Lets see if its possible to get a basis going on this date or now."
-    basis_tokens = tokenize(basis_txt)
+def encode_str_offset(bit_str):
+    # Pad with zeros if needed
+    pad = bit_str + "0" * ((8 - len(bit_str) % 8) % 8)
+
+    # Group every 8 bits, convert to bytes
+    byte_arr = bytearray(int(pad[i:i+8], 2) for i in range(0, len(pad), 8))
+    packed_str = ""
+    offset = 32 #(31-min_b) if min_b < 31 else 0
+    remainder = 0
+    for b in byte_arr:
+        c = printable_idx(b * (1<<ceil(log2(remainder+1))) + remainder) 
+        c, remainder = c % (2**8), c // (2**8)
+        print("encode_str().b,c,r,logr = ", b, c, remainder, 1<<ceil(log2(remainder+1))) if vb else None
+        packed_str += chr(c) 
+    packed_str += chr(remainder) if remainder > 0 else ""
+    return packed_str, {}, offset
+
+
+def encode_subtoken(bit_str):
+    # Pad with zeros if needed
+    pad = bit_str + "0" * ((8 - len(bit_str) % 8) % 8)
+
+    # Group every 8 bits, convert to bytes
+    byte_arr = bytearray(int(pad[i:i+8], 2) for i in range(0, len(pad), 8))
+    packed_str = ""
+    offset = 32 #(31-min_b) if min_b < 31 else 0
+    remainder, c, c1, w = 0, None, None, 3
+    for i,b in enumerate(byte_arr):
+        v = token_idx(b) if i%w == 0 else token_idx(b, key=c, key1=c1, w=w) 
+        c = v if i%3 == 0 or w<3 else c
+        c1 = b if i%3 == 1 and w==3 else None
+        print("encode_subtoken().b,c,v,c1=",b,ord(c),ord(v),c1) if vb else None
+        packed_str += v
+    packed_str += chr(remainder) if remainder > 0 else ""
+    return packed_str, {}, offset
+
+
+# assume you have: from your_module import tokenize
+# and an optional global `vb` for verbose logging
+
+def load_basis_sorted(txt, basis_fn="basis.json", refresh=False):
+    """
+    Maintains a sorted histogram (most frequent first) of basis strings (single-token strings).
+    - Persists a JSON list of {"token": int, "text": str, "count": int} to `basis_fn`.
+    - Updates counts based on tokenization of `txt`.
+    - Returns a tuple for backward-compatibility:
+        basis_txt (space-joined sorted strings),
+        basis (sorted list of strings),
+        basis_tokens (sorted list of token ids),
+        new_txt (space-joined strings added for the first time),
+        new_toks (list of token ids added for the first time),
+        txts (decoded strings for tokens in `txt`),
+        txt_tokens (token ids for `txt`)
+    """
     enc = tiktoken.get_encoding("cl100k_base")
-    basis_decode = str("basis_decode = [" + enc.decode(basis_tokens) + "]")
-    basis_msg = str("basis = " + " ".join([str(t) for t in basis_tokens]))
-    Nbits = ceil(log2(len(basis_tokens)))
-    Nbits = 4 if Nbits<5 else (8 if Nbits<9 else (16 if Nbits<17 else Nbits))  # LLM seems to prefer evens
-    txt = "What is the time now?"
-    tokens = [basis_tokens.index(t) for t in tokenize(txt)]
-    txt_bits = "".join([f"{t:0{Nbits}b}" for t in tokens])
-    print("define().basis_msg =", basis_msg, ",\n\n ---------------\n", basis_decode, ":", len(basis_tokens), "\n---------------\n , tokens =", tokens, ":", len(tokens), ", Nbits=", Nbits, txt_bits, ":", len(txt_bits))
-    s, np = encode_str(txt_bits)
-    print("define().s=", s, ", np=", np, ", Nbits=", Nbits)
-    #s, np = encode_str("1111111100000000")
-    #msg = str("The encoded strings I will provide are produced by packing bit arrays into bit-strings. The non-print characters are provided in this map: "+str(np)+". Decode the non-print characters first and then the printable characters second in the encoded string and show the output where encoded-string: '" + s + "'. Note the length of the string.")
-    msg = str("\n-----------------\nThe encoded strings I will provide are produced by packing bit arrays into bit-strings. The np strings are provided in this map: "+str(np)+" where a string of quoted characters is considered the key and the value is interpreted as a byte. Replace the key/value pairs in the np map, from the encoded string: '"+s+"'.  Do not produce any code. Treat single quotes as end-of string markers. Treat every value as a "+str(Nbits)+" bit tuple lookup the corresponding entries from the basis_decode list.\n\n Execute the resulting query.\n--------------------\n")
 
-    #msg = str("The encoded strings I will provide are produced by packing bit arrays into bit-strings. The np strings are provided in this map: "+str(np)+" where a string of quoted characters is considered the key and the value is interpreted as a byte. Replace the np keys with values, while all remaining characters are replaced with their ascii value byte, in the encoded string: '" + s + "'. Do not split the encoded string as the np keys have variable length, and do not produce any code.")
-    print("define_basis().msg =", msg, "\n\n")
+    # Tokenize the new input text (single-token handling downstream)
+    txt_tokens = tokenize(txt)
+    txts = [enc.decode([tok]).strip() for tok in txt_tokens]
+    # Filter out empty/whitespace-only decodes
+    pairs = [(tok, s) for tok, s in zip(txt_tokens, txts) if s]
+
+    # Load existing histogram
+    hist = {}  # token_id -> {"token": int, "text": str, "count": int}
+    added_this_run = set()  # track which token ids are *newly* added in this call
+
+    if os.path.exists(basis_fn) and not refresh:
+        try:
+            with open(basis_fn, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Validate/normalize loaded data
+            for item in data:
+                tok = int(item["token"])
+                txt_str = str(item["text"])
+                cnt = int(item.get("count", 0))
+                if txt_str:
+                    hist[tok] = {"token": tok, "text": txt_str, "count": max(cnt, 0)}
+        except Exception:
+            # Fallback if file exists but is not JSON (legacy whitespace basis)
+            with open(basis_fn, "r", encoding="utf-8", errors="ignore") as f:
+                legacy = f.read()
+            legacy_tokens = tokenize(legacy)
+            for tok in legacy_tokens:
+                s = enc.decode([tok]).strip()
+                if s:
+                    if tok not in hist:
+                        hist[tok] = {"token": tok, "text": s, "count": 0}
+                    hist[tok]["count"] += 1
+    else:
+        # refresh -> start from empty histogram
+        hist = {}
+
+    # Update histogram with the new text tokens
+    for tok, s in pairs:
+        if tok not in hist:
+            hist[tok] = {"token": tok, "text": s, "count": 0}
+            added_this_run.add(tok)
+        hist[tok]["count"] += 1
+
+    # Sort by count desc, then by text asc (stable secondary)
+    sorted_items = sorted(hist.values(), key=lambda d: (-d["count"], d["text"]))
+
+    # Build outputs in sorted order
+    basis = [item["text"] for item in sorted_items]
+    basis_tokens = [item["token"] for item in sorted_items]
+    basis_txt = " ".join(basis)
+
+    # New tokens/strings added *this* call (not previously in hist)
+    new_toks = [tok for tok in basis_tokens if tok in added_this_run]
+    new_txt_items = [enc.decode([tok]).strip() for tok in new_toks]
+    new_txt_items = [s for s in new_txt_items if s]
+    new_txt = (" " + " ".join(new_txt_items)) if new_txt_items else ""
+
+    # Persist updated histogram (robust JSON)
+    with open(basis_fn, "w", encoding="utf-8") as f:
+        json.dump(sorted_items, f, ensure_ascii=False, indent=2)
+
+    if 'vb' in globals() and vb:
+        print("define().basis (top 20) =", basis[:20])
+
+    return basis_txt, basis, basis_tokens, new_txt, new_toks, txts, txt_tokens
+
+
+
+def load_basis(txt, basis_fn="basis.txt", refresh=False):
+    basis_txt, new_txt = "Sample basis", "" # today? Lets see if its possible to get a basis going on this date or now."
+    new_toks, txt_tokens = [], tokenize(txt)
+    if os.path.exists(basis_fn):
+        with open(basis_fn, "r") as f:
+            basis_txt = f.read()
+    #basis = basis_txt.split(" ")
+    basis_tokens = tokenize(basis_txt)
+    basis = [enc.decode([tok]).strip() for tok in basis_tokens]
+    print("define().basis =", basis) if vb else None
+    txts = [enc.decode([tok]).strip() for tok in txt_tokens]
+    for word, tok in zip(txts, txt_tokens): 
+        if not word in basis:
+            basis_tokens.append(tok)
+            new_toks.append(tok)
+            new_txt += f" {word.strip()}"
+            basis.append(word.strip())
+    if len(new_txt) > 0:
+        with open(basis_fn, "w") as f:
+            f.write(basis_txt + new_txt)
+    basis_txt += new_txt
+    return basis_txt, basis, basis_tokens, new_txt, new_toks, txts, txt_tokens
+
+
+def define_basis_prompt(txt="What is the time now?", fn="basis.txt", refresh=False, encode_fn=encode_str_offset):
+    basis_txt, basis, basis_tokens, new_txt, new_toks, txts, txt_tokens = load_basis_sorted(txt,fn,refresh)
+    used_toks = 0
+    print("define_basis().basis_txt =", basis_txt, ", basis =", basis_tokens, len(txt_tokens), len(txt.split(" ")), len(list(zip(txt_tokens, txt.split(" "))))) if vb else None
+
+    basis_decode = str("basis_decode = [" + enc.decode(basis_tokens) + "]")
+    if refresh:
+        basis_msg = str("basis = "+" ".join([enc.decode([t]) for t in basis_tokens]))
+    else:
+        basis_msg =str("Append to basis = "+" ".join([enc.decode([t]) for t in new_toks]))
+
+    tokens = [basis.index(t) for t in txts]
+    Nbits = max([ceil(log2(t+1)) for t in tokens])
+    txt_bits = "".join([f"{t:0{Nbits}b}" for t in tokens])
+    used_toks += len(tokenize(basis_msg))
+    specific_toks = len(new_toks)
+    print("define().basis_decode =", basis_decode, ",\n\n ---------------\n", basis_msg, ":", len(basis_tokens if refresh else new_toks), "\n---------------\n , tokens =", tokens, ":", len(tokens), ", Nbits=", Nbits, txt_bits, ":", len(txt_bits)) if vb else None
+    s, np, offset = encode_fn(txt_bits)
+    print("define().s=", s, ":", len(s), ", np=", np, ", Nbits=", Nbits, ", txt=", txt, ":", len(txt)) if vb else None
+    msg = str("\n-----------------\nThe encoded strings I will provide are produced by packing bit arrays into bit-strings. The np strings are provided in this map: "+str(np)+" where a string of quoted characters is considered the key and the value is interpreted as a byte. Replace the key/value pairs in the np map, from the encoded string: '"+s+"'.  Do not produce any code. Treat single quotes as end-of string markers. Treat every value as a "+str(Nbits)+" bit tuple lookup the corresponding entries from the basis_decode list.\n\n Execute the resulting query.\n--------------------\n")
+    used_toks += len(tokenize(msg))
+    specific_toks = len(tokenize(s))
+    print("define_basis().specific_toks =", specific_toks, ", s=", len(s)) if vb else None #[enc.decode([tok]) for tok in tokenize(s)]) if vb else None
+    #specific_toks += len(tokenize(s))
+
+    print("define_basis().msg =", msg, "\n\n original_toks =", len(txt_tokens), " total_used_toks =", used_toks, " actual_toks =", len(tokenize(txt)), " used_toks =", specific_toks) if vb else None
     if True:
-        return
+        return s, len(txt_tokens), used_toks, specific_toks
+
     def_resp = ollama.chat(model='llama3', messages=[
         {"role": "user", "content": msg }
     ])
     print("define().resp =", def_resp['message']['content']) if vb else None
     if True:
-        return
+        return s, len(txt_tokens), used_toks, specific_toks
+
+
+    # ----------------- Done ------------------
 
     torder, tbasis, tw = get_payload("This is a test")
     qorder, qbasis, qw = get_payload("What is the date today")
@@ -905,24 +1136,21 @@ def define_basis_prompt():
 
     msg = str("This is the definition of a translation basis set we will be using on future prompts. The basis is a set of all tokens used in the prompts. Each prompt will consist of a basis subset (tree-encoded with a root node of count n, where each node consists of a single left child count and the right child count is inferred as the parent count - left child count and the counter width is the parent count width - ceil(log2(parent-count))) and a packed bitstring of ids defining basis token sort order where the first half use full precision (w bits), half of the remainder use w-1 bits, half of the remainder w-2 bits, etc. Use these, and the basis superset (below) to decode the full prompt: \n" + encode_tokens(all_tokens))
 
-    #print("define().basis definition msg =", msg) if vb else None
-
     def_resp = ollama.chat(model='llama3', messages=[
         {"role": "user", "content": msg }
     ])
     print("define().resp =", def_resp['message']['content']) if vb else None
 
-    msg = str("An example encoding is shown below: basis-subset0: \n" + encode_str(tbasis) + " (encoded value "+str(tbasis)+") \n sort-order0: \n" + encode_str(torder) + " (encoded value "+str(torder)+") \n w0=" + str(tw) + "\n original-text0: 'This is a test'" + ".\n Answer the following in encoded format (with basis-subset and sort-order keys): basis-subset1: \n" + encode_str(qbasis) + "\n sort-order1: \n" + encode_str(qorder) + "\n w=" + str(qw))
+    msg = str("An example encoding is shown below: basis-subset0: \n" + encode_fn(tbasis) + " (encoded value "+str(tbasis)+") \n sort-order0: \n" + encode_fn(torder) + " (encoded value "+str(torder)+") \n w0=" + str(tw) + "\n original-text0: 'This is a test'" + ".\n Answer the following in encoded format (with basis-subset and sort-order keys): basis-subset1: \n" + encode_fn(qbasis) + "\n sort-order1: \n" + encode_fn(qorder) + "\n w=" + str(qw))
     print("define().basis test msg =", msg) if vb else None
 
     test_resp = ollama.chat(model='llama3', messages=[
         {"role": "user", "content": msg}
     ])
 
-    #print("define_prompt().test_resp =", test_resp['message']['content']) if vb else None
     with open("test_resp.txt", "w") as f:
         f.write(test_resp['message']['content'])
-    return test_resp['message']['content']
+    return test_resp['message']['content'], len(txt_tokens), used_toks, specific_toks
 
 
 def prompt(q):
@@ -943,6 +1171,30 @@ def prompt(q):
     return response['message']['content']
 
 
+def chat():
+    global vb
+    vb = True
+    txt = ""
+    while txt.lower() != "no":
+        print("\n\nEnter your prompt: \n")
+        inp = input()
+        out, _, _, _ = define_basis_prompt(txt=inp)
+        print("\n\nContinue? (yes|no) \n")
+        txt = input()
+    return
+
+def random_word(min_len=2, max_len=10):
+    """Generate a random 'word' with letters a-z."""
+    length = random.randint(min_len, max_len)
+    return ''.join(random.choice(string.ascii_lowercase) for _ in range(length))
+
+def random_sentence(num_words=5):
+    """Generate a random sentence of a given number of words."""
+    words = [random_word() for _ in range(num_words)]
+    sentence = " ".join(words).capitalize() + "."
+    return sentence
+
+
 # ────────────────────────── tiny demo ──────────────────────────
 
 if __name__ == "__main__":
@@ -958,7 +1210,24 @@ if __name__ == "__main__":
 
     fn = "" #persist(TEXT, L=L, fn="local_tree.bin", f=f, Nk=Nk)
     #out = load(fn)
-    out = define_basis_prompt()
+    if "-C" in sys.argv:
+        chat()
+        exit(0)
+
+    #get_wchar_tokens(3)
+    #if True:
+    #    exit(0)
+    #out, _ = define_basis_prompt()
+
+    # Example: generate 5 sentences with different lengths
+    for i in range(1):
+      for length in [3]: #, 5, 7, 10, 12]: #, 5, 7, 10, 12]:
+        s = random_sentence(length)
+        out, toks, total, specific = define_basis_prompt(s,encode_fn=encode_subtoken)
+        #print("in.len=",s, "out.len=", out, "in.toks=", toks,"out.total=", total, "out.specific=",specific)
+        print("in.len=",len(s), "out.len=", len(out), "in.toks=", toks,"out.total=", total, "out.specific=",specific)
+    s = "what time of day is it?"
+    out,_,_,_ = define_basis_prompt(s, encode_fn=encode_subtoken)
     #out = prompt("what time of day is it?")
 
     #print("saved", fn, "(size:", os.path.getsize(fn), "bytes)")
