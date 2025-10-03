@@ -19,7 +19,7 @@
 
 import random
 import string
-import base64, math, sys, re, numpy as np
+import base64, io, math, sys, re, numpy as np
 import ollama, os, pickle, tiktoken
 import json
 from collections import defaultdict
@@ -30,6 +30,8 @@ from scipy.special import lambertw
 from typing import Dict, List
 
 # ────────────────────────── bit utils ──────────────────────────
+sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')
+
 vb = False
 
 enc = tiktoken.get_encoding("cl100k_base")
@@ -56,13 +58,22 @@ def get_wchar_tokens(w = 2):
         # Token is invalid for decoding, skip it
         continue
 
-    # Filter for exactly 2-character tokens
+    # Filter for w-character tokens
+    print("get_wchar_tokens().w0=", len([tok for tok in all_tokens if len(tok) >= 0]))
+    print("get_wchar_tokens().w1=", len([tok for tok in all_tokens if len(tok) >= 1]))
+    print("get_wchar_tokens().w2=", len([tok for tok in all_tokens if len(tok) >= 2]))
+    print("get_wchar_tokens().w3=", len([tok for tok in all_tokens if len(tok) >= 3]))
     wchar_tokens = [tok for tok in all_tokens if len(tok) >= w]
     wtok_map = {}
     for tok in wchar_tokens:
         if not tok[0] in wtok_map.keys():
-            wtok_map[tok[0]] = []
-        wtok_map[tok[0]].append(tok[1:])
+            wtok_map[tok[0]] = {} 
+        if len(tok)>0 and not tok[1] in wtok_map[tok[0]].keys():
+            wtok_map[tok[0]][tok[1]] = []
+        if len(tok)>0:
+            wtok_map[tok[0]][tok[1]].append(tok[2:]) 
+        #else:
+        #    wtok_map[tok[0]].append(tok[1:]) 
     print("get_wchar_tokens().keys,v.len =", len(wtok_map.keys()), sum([len(v) for k,v in wtok_map.items()])/len(wtok_map.keys())) if vb else None
     return wtok_map
 
@@ -891,21 +902,41 @@ def printable_idx(idx):
 
 def token_idx(idx, key=None, key1=None, w=2):
     tokmap = get_wchar_tokens(w=w)
-    print("token_idx().idx,len,k,k1,w =", idx, len(tokmap.keys()), key, key1, w) if vb else None
+    print("token_idx().idx,len,k,k1,w =", idx, len(tokmap.keys()), prt(key), prt(key1), w) if vb else None
     if key is None:
         if idx >= len(tokmap.keys()):
             key = list(tokmap.keys())[len(tokmap.keys())-1] 
             return key # + token_idx(idx % len(tokmap.keys()), key)
         return list(tokmap.keys())[idx]
     if key1 is None:
-        if idx >= len(tokmap[key]):
-            return tokmap[key][-1][0]
-        return tokmap[key][idx][0]
+        print("token_idx().k.len =", len(tokmap[key].keys()), tokmap[key])
+        if idx >= len(list(tokmap[key].keys())):
+            return list(tokmap[key].keys())[-1]
+        return list(tokmap[key].keys())[idx]
     else:
-        key1 = -1 if key1 >= len(tokmap[key]) else key1
+        #key1 = -1 if not key1 in tokmap[key] else key1
+        print("token_idx().map.k.k1 =", len(tokmap[key][key1]), tokmap[key][key1])
         if idx >= len(tokmap[key][key1]):
             return tokmap[key][key1][-1]
         return tokmap[key][key1][idx]
+
+
+def token_to_idx(token_char, key=None, key1=None, w=2):
+    """
+    Inverse of token_idx():
+    """
+    tokmap = get_wchar_tokens(w=w)
+    print("token_char_to_idx().token,key,key1,w =", token_char, key, key1, w) if vb else None
+
+    if key is None:
+        print("token_char_to_idx().key.len=", len(list(tokmap.keys())))
+        return list(tokmap.keys()).index(token_char)
+    if key1 is None:
+        print("token_char_to_idx().key1.len=", len(list(tokmap[key].keys())))
+        return list(tokmap[key].keys()).index(token_char)
+    print("token_char_to_idx().len=", len(list(tokmap[key][key1])))
+    return tokmap[key][key1].index(token_char)
+
 
 
 def encode_str(bit_str):
@@ -959,23 +990,43 @@ def encode_str_offset(bit_str):
     return packed_str, {}, offset
 
 
+def prt(c):
+    return str(c) if c else "None"
+
+
 def encode_subtoken(bit_str):
     # Pad with zeros if needed
-    pad = bit_str + "0" * ((8 - len(bit_str) % 8) % 8)
+    b = 16
+    #pad = bit_str + "0" * ((8 - len(bit_str) % 8) % 8)
+    pad = bit_str + "0" * ((b - len(bit_str) % b) % b)
 
     # Group every 8 bits, convert to bytes
-    byte_arr = bytearray(int(pad[i:i+8], 2) for i in range(0, len(pad), 8))
-    packed_str = ""
-    offset = 32 #(31-min_b) if min_b < 31 else 0
-    remainder, c, c1, w = 0, None, None, 3
-    for i,b in enumerate(byte_arr):
-        v = token_idx(b) if i%w == 0 else token_idx(b, key=c, key1=c1, w=w) 
-        c = v if i%3 == 0 or w<3 else c
-        c1 = b if i%3 == 1 and w==3 else None
-        print("encode_subtoken().b,c,v,c1=",b,ord(c),ord(v),c1) if vb else None
-        packed_str += v
-    packed_str += chr(remainder) if remainder > 0 else ""
-    return packed_str, {}, offset
+    #byte_arr = bytearray(int(pad[i:i+8], 2) for i in range(0, len(pad), 8))
+    packed_str = "".join([enc.decode([int(pad[i:i+16],2)]) for i in range(0,len(pad),16)])
+    print("encode_subtoken().packed_str = ", len(packed_str), packed_str, enc.encode(packed_str)) if vb else None
+    #c, c1, w = None, None, 3
+    #for i,b in enumerate(byte_arr):
+        #v = token_idx(b,w=w) if i%w == 0 else token_idx(b, key=c, key1=c1, w=w) 
+        #c = v if i%3 == 0 or w<3 else c
+        #c1 = v if i%3 == 1 and w==3 else None
+        #print("encode_subtoken().b,c,v,c1=",b,prt(c),prt(v),prt(c1)) if vb else None
+        #packed_str += v
+    return packed_str, {}, None
+
+
+def decode_subtoken(packed_str, w=2):
+    #k, k1, byte_arr = None, None, []
+    #for i,c in enumerate(packed_str):
+    #    b = token_to_idx(c, w=w, key=k, key1=k1)
+    #    print("decode_subtoken().b =", b)
+    #    k = c if i % w == 0 or w < 3 else k
+    #    k1 = c if i % w == 1 and w == 3 else None
+    #    byte_arr.append(b)
+    bitstr = ''.join(f"{b:016b}" for b in enc.encode(packed_str))
+    #bitstr = ''.join(f"{b:08b}" for b in byte_arr)
+    print("decode_subtoken().packed_str,bitstr = ", len(packed_str), packed_str, enc.encode(packed_str), bitstr) if vb else None
+    return bitstr
+
 
 
 # assume you have: from your_module import tokenize
@@ -1089,6 +1140,16 @@ def load_basis(txt, basis_fn="basis.txt", refresh=False):
     return basis_txt, basis, basis_tokens, new_txt, new_toks, txts, txt_tokens
 
 
+def decode_basis_prompt(packed_str="", fn="basis.txt", refresh=False, encode_fn=encode_str_offset, w=2, Nbits=16, Ntok=-1):
+    basis_txt, basis, basis_tokens, new_txt, new_toks, txts, txt_tokens = load_basis_sorted("",fn,refresh)
+    txt = decode_subtoken(packed_str, w=w)
+    txts = [txt[i:i+Nbits] for i in range(0, len(txt), Nbits)][:Ntok]
+    print("decode_prompt().txt,txts =", txt, txts, [int(t,2) for t in txts]) 
+    msg = " ".join([basis[int(txt,2)] for txt in txts])
+    print("decode_prompt().msg =", msg, ", basis_txt =", basis_txt, ", basis =", basis_tokens, len(txt_tokens), len(txt.split(" ")), len(list(zip(txt_tokens, txt.split(" "))))) if vb else None
+    return msg
+
+
 def define_basis_prompt(txt="What is the time now?", fn="basis.txt", refresh=False, encode_fn=encode_str_offset):
     basis_txt, basis, basis_tokens, new_txt, new_toks, txts, txt_tokens = load_basis_sorted(txt,fn,refresh)
     used_toks = 0
@@ -1111,19 +1172,18 @@ def define_basis_prompt(txt="What is the time now?", fn="basis.txt", refresh=Fal
     msg = str("\n-----------------\nThe encoded strings I will provide are produced by packing bit arrays into bit-strings. The np strings are provided in this map: "+str(np)+" where a string of quoted characters is considered the key and the value is interpreted as a byte. Replace the key/value pairs in the np map, from the encoded string: '"+s+"'.  Do not produce any code. Treat single quotes as end-of string markers. Treat every value as a "+str(Nbits)+" bit tuple lookup the corresponding entries from the basis_decode list.\n\n Execute the resulting query.\n--------------------\n")
     used_toks += len(tokenize(msg))
     specific_toks = len(tokenize(s))
-    print("define_basis().specific_toks =", specific_toks, ", s=", len(s)) if vb else None #[enc.decode([tok]) for tok in tokenize(s)]) if vb else None
-    #specific_toks += len(tokenize(s))
+    print("define_basis().specific_toks =", specific_toks, ", txt_toks =", len(tokenize(txt)), ", s=", len(s)) if vb else None 
 
     print("define_basis().msg =", msg, "\n\n original_toks =", len(txt_tokens), " total_used_toks =", used_toks, " actual_toks =", len(tokenize(txt)), " used_toks =", specific_toks) if vb else None
     if True:
-        return s, len(txt_tokens), used_toks, specific_toks
+        return s, Nbits, len(txt_tokens), used_toks, specific_toks
 
     def_resp = ollama.chat(model='llama3', messages=[
         {"role": "user", "content": msg }
     ])
     print("define().resp =", def_resp['message']['content']) if vb else None
     if True:
-        return s, len(txt_tokens), used_toks, specific_toks
+        return s, Nbits, len(txt_tokens), used_toks, specific_toks
 
 
     # ----------------- Done ------------------
@@ -1150,7 +1210,7 @@ def define_basis_prompt(txt="What is the time now?", fn="basis.txt", refresh=Fal
 
     with open("test_resp.txt", "w") as f:
         f.write(test_resp['message']['content'])
-    return test_resp['message']['content'], len(txt_tokens), used_toks, specific_toks
+    return test_resp['message']['content'], Nbits, len(txt_tokens), used_toks, specific_toks
 
 
 def prompt(q):
@@ -1216,8 +1276,16 @@ if __name__ == "__main__":
 
     #get_wchar_tokens(3)
     #if True:
-    #    exit(0)
+    #   exit(0)
     #out, _ = define_basis_prompt()
+    s = "what time of day is it?"
+    #vb = True
+    packed,Nbits,ntok,_,_ = define_basis_prompt(s, encode_fn=encode_subtoken)
+    #vb = True
+    out = decode_basis_prompt(packed, w=3, Nbits=Nbits, Ntok=ntok)
+    print("s =", s, ":", len(tokenize(s)), ", packed =", packed, ":", len(tokenize(packed)), ", out =", out)
+    if True:
+        exit(0)
 
     # Example: generate 5 sentences with different lengths
     for i in range(1):
@@ -1226,8 +1294,6 @@ if __name__ == "__main__":
         out, toks, total, specific = define_basis_prompt(s,encode_fn=encode_subtoken)
         #print("in.len=",s, "out.len=", out, "in.toks=", toks,"out.total=", total, "out.specific=",specific)
         print("in.len=",len(s), "out.len=", len(out), "in.toks=", toks,"out.total=", total, "out.specific=",specific)
-    s = "what time of day is it?"
-    out,_,_,_ = define_basis_prompt(s, encode_fn=encode_subtoken)
     #out = prompt("what time of day is it?")
 
     #print("saved", fn, "(size:", os.path.getsize(fn), "bytes)")
