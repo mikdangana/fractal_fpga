@@ -36,7 +36,7 @@ PACKAGE reg24gen_package IS
     CONSTANT DATASET_SIZE: INTEGER := 2**28;
     CONSTANT W_ADDR : INTEGER := 16;
     CONSTANT RAM_LEN: INTEGER := (2**20) / W_ADDR; --(2**28) / W_ADDR;
-    CONSTANT N_BKTS: INTEGER := 3;
+    CONSTANT N_BKTS: INTEGER := 2;  -- slot 0: write zeros+ones count; slot 1: read-back for accumulation
 
     -- Function to generate a set of N random numbers
     impure function generate_rand_set(
@@ -199,6 +199,7 @@ library IEEE;
 USE work.reg24gen_package.ALL;
 use IEEE.STD_LOGIC_1164.ALL;
    use ieee.numeric_std.all;
+use STD.TEXTIO.ALL;
 
 entity counter is
     Generic ( LEVEL_SIZE : integer := INPUT_SIZE;
@@ -216,7 +217,6 @@ entity counter is
 	           --PRECISIONS : integer := PRECISIONS;
 				  --PADDING : integer := PADDING );
 	 Port ( clk : in std_logic;
-	        d_p : in std_logic_vector(LEVEL_SIZE-1 downto 0);
 	        reset : in std_logic;
 			  numbers_p : in std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0);
 			  starts_p : in std_logic_vector(LEVEL_SIZE*log2ceil(LEVEL_SIZE)-1 downto 0);
@@ -289,9 +289,9 @@ architecture Behavioral of counter is
     type slv_base_arr  is array (natural range <>, natural range <>) of std_logic_vector(BASE_INPUT_SIZE-1 downto 0);
     type slv_basep_arr is array (natural range <>, natural range <>) of std_logic_vector(BASE_INPUT_SIZE*PRECISIONS-1 downto 0);
     
-    type count_1d_t is array (natural range <>) of integer;
-    type count_2d_t is array (natural range <>, natural range <>) of integer;
-    type count_3d_t is array (natural range<>, natural range <>, natural range <>) of integer;
+    type count_1d_t is array (natural range <>) of integer range 0 to LEVEL_SIZE;
+    type count_2d_t is array (natural range <>, natural range <>) of integer range 0 to LEVEL_SIZE;
+    type count_3d_t is array (natural range<>, natural range <>, natural range <>) of integer range 0 to LEVEL_SIZE;
 
 	
 	--signal test: std_logic_vector(100000000-1 downto 0);
@@ -308,7 +308,6 @@ architecture Behavioral of counter is
    --signal numout : std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0) := (LEVEL_SIZE*PRECISIONS-1 downto 0 => '0');
 	
 	
-	alias MyInput: std_logic_vector(d_p'Length-1 downto 0) IS d_p;
     alias MyNumbers: std_logic_vector(numbers_p'Length-1 downto 0) IS numbers_p; --LEVEL_SIZE*PRECISIONS-1 downto 0) IS numbers;
    
     signal node_ids_0 : std_logic_vector(numbers_p'Length-1 downto 0);
@@ -324,26 +323,25 @@ architecture Behavioral of counter is
     signal child_count   : int_child_arr      (0 to N-1);
  
     -- Enough space for all levels; second dimension sized by N_BASE
-    signal node_count : count_3d_t(0 to N_LEVELS, 0 to logNceil(LEVEL_SIZE, N), 0 to LEVEL_SIZE-1) := (others => (others => (others => 0)));
     --signal node_ids : count_2d_t(0 to N_LEVELS, 0 to LEVEL_SIZE-1) := (others => (others => 0));
-    --signal sorted_node_ids : count_3d_t(0 to N_SHARDS, 0 to N_LEVELS, 0 to LEVEL_SIZE-1) := (others => (others => (others => 0)));
-    --signal start_pos : count_2d_t(0 to N_LEVELS, 0 to LEVEL_SIZE-1) := (others => (others => 0));
-    signal start_pos : count_1d_t(0 to LEVEL_SIZE) := (others => 0);
-    signal sorted_start_level1 : count_1d_t(0 to N_LEVELS*LEVEL_SIZE) := (others => 0);
     signal sorted_start_level : count_2d_t(0 to N_LEVELS, 0 to LEVEL_SIZE) := (others => (others => 0));
-    signal sorted_end_level : count_2d_t(0 to N_LEVELS, 0 to LEVEL_SIZE) := (others => (others => 0));
+    signal sorted_end_level   : count_2d_t(0 to N_LEVELS, 0 to LEVEL_SIZE) := (others => (others => 0));
+    -- Per-node counts of d_p=0 and d_p=1 entries within each node's [start,end) range.
+    -- split_level(l,pos) = sorted_start_level(l,pos) + node_zeros(l,pos)
+    --   = first position of the 1-group after the 0-group is placed.
+    signal node_zeros  : count_2d_t(0 to N_LEVELS-1, 0 to LEVEL_SIZE-1) := (others => (others => 0));
+    signal node_ones   : count_2d_t(0 to N_LEVELS-1, 0 to LEVEL_SIZE-1) := (others => (others => 0));
+    signal split_level : count_2d_t(0 to N_LEVELS-1, 0 to LEVEL_SIZE-1) := (others => (others => 0));
+    signal fs_total_ones : count_1d_t(0 to N_LEVELS-1) := (others => 0);
     signal ram : slv_ram_arr(0 to RAM_LEN-1) := (others => (others => '0'));
     --signal n_address1 : count_1d_t(0 to N_BKTS*LEVEL_SIZE) := (others => 0);
-    signal n_address : count_2d_t(0 to N_LEVELS, 0 to LEVEL_SIZE) := (others => (others => 0));
-    signal req_qhead: integer := 0;
-    signal req_qtail: integer := 0;
-    signal req_q : count_1d_t(0 to N_BKTS*LEVEL_SIZE) := (others => 0);
     signal req_addr  : addr_array(0 to N_BKTS*LEVEL_SIZE) := (others => (others => '0'));
     signal req_data  : data_array(0 to N_BKTS*LEVEL_SIZE) := (others => (others => '0'));
     signal req_valid : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
     signal req_ack   : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
     signal req_re_en : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
     signal req_wr_en : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
+	signal req_turn  : integer range 0 to N_BKTS*LEVEL_SIZE-2 := 0;
 	signal fifo_wr_ens: std_logic := '0';
 	signal fifo_re_ens: std_logic := '0';
 	signal fifo_dws: std_logic_vector(4*W_ADDR-1 downto 0) := (others => '0');
@@ -351,46 +349,6 @@ architecture Behavioral of counter is
 	signal fifo_dreadys: std_logic := '0';
     
 
-	signal e1_1 : slv1_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal e1_2 : slv2_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal e1_3 : slv3_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal e2_1 : slv1_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal e2_2 : slv2_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal e2_3 : slv3_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal e3_1 : slv1_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal e3_2 : slv2_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal e3_3 : slv3_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal n1_1 : slv_p_arr   (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal n1_2 : slv_2p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal n1_3 : slv_3p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal n2_1 : slv_p_arr   (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal n2_2 : slv_2p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal n2_3 : slv_3p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal n3_1 : slv_p_arr   (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal n3_2 : slv_2p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal n3_3 : slv_3p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal m1_1 : slv_p_arr   (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal m1_2 : slv_2p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal m1_3 : slv_3p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal m2_1 : slv_p_arr   (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal m2_2 : slv_2p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal m2_3 : slv_3p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    signal m3_1 : slv_p_arr   (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal m3_2 : slv_2p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal m3_3 : slv_3p_arr  (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    
-    
-    signal o1   : slv_base_arr (0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal o3   : slv_basep_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
-    signal o5   : slv_basep_arr(0 to N_SHARDS, 0 to N_BASE-1) := (others => (others => (others => '0')));
 
 
 	--signal e1_1: std_logic_vector(0 downto 0) := (0 downto 0 => '0');
@@ -445,6 +403,7 @@ architecture Behavioral of counter is
 	signal mem_value1: std_logic_vector(4*W_ADDR downto 0) := (others => '0');
 	signal mem_slot_available: integer := 10;
 	signal turn: integer := 0;
+	signal pipe_level : integer range 0 to N_LEVELS := 0;
 	
 	
 	-- Reusable array types (one element per ffnode)
@@ -466,6 +425,25 @@ architecture Behavioral of counter is
     signal numout_level : slv_segP_arr(0 to N_LEVELS, 0 to logNceil(LEVEL_SIZE,N)+1) := (others => (others => (INPUT_SIZE*PRECISIONS-1 downto 0 => '0')));
     --signal nodeids_level : slv_segP_arr(0 to N_SHARDS, 0 to N_LEVELS) := (others => (0 to N_LEVELS => (INPUT_SIZE*PRECISIONS-1 downto 0 => '0')));
        
+
+    -- Sort-key bit layout within each PRECISIONS-bit entry:
+    --   bits 0..2*LOGN   : metadata (not loaded from raw_numbers)
+    --   bits 2*LOGN+1..PRECISIONS-1 : 41 raw key bits
+    -- KEY_OFFSET = 7 (for LOGN=3), KEY_GROUPS = 14 distinct LOGN-bit groups.
+    -- KBASE(l) gives the first bit of the key group used at pipeline level l.
+    -- Defined here so it is available in both pipeline_regs and ff_cd_node_ids.
+    constant KEY_OFFSET : integer := 2*LOGN + 1;
+    constant KEY_GROUPS : integer := (PRECISIONS - KEY_OFFSET) / LOGN;
+    type kbase_t is array (0 to N_LEVELS-1) of integer;
+    function make_kbases return kbase_t is
+        variable t : kbase_t;
+    begin
+        for l in 0 to N_LEVELS-1 loop
+            t(l) := KEY_OFFSET + (l mod KEY_GROUPS) * LOGN;
+        end loop;
+        return t;
+    end function;
+    constant KBASE : kbase_t := make_kbases;
 
 	-- Handy per-node initial constants (avoid repeating expressions)
 	constant PREC_ONE      : std_logic_vector(PRECISIONS-1 downto 0)
@@ -603,229 +581,362 @@ architecture Behavioral of counter is
 	begin
 		
 		
-    ff_cd_node_ids: process(clk, sorted_end_level, sorted_start_level, n_address, numout_level)
-        variable total_count: integer := to_integer(unsigned(ram(0))); -- TODO: Align counter width
+    -- ff_cd_node_ids: single combinational process.
+    -- Node ID grows with l: bits min(l,LOGN)-1..0 hold the node address.
+    -- Reads LOGN bits, masks off bits above min(l,LOGN)-1 at runtime.
+    ff_cd_node_ids: process(numout_level)
+        variable nid_raw  : std_logic_vector(LOGN-1 downto 0);
+        variable nid_i    : integer range 0 to LEVEL_SIZE-1;
+        variable v_start  : integer;
+        variable v_end    : integer;
+        variable nid_bits : integer range 0 to LOGN;
     begin
         for l in 0 to N_LEVELS-2 loop
-          for i in 0 to LEVEL_SIZE-2 loop
-            if (rising_edge(clk)) then
-              if ((numout_level(l, logNceil(LEVEL_SIZE, N))(min(((i+0)*PRECISIONS)+(2*LOGN)+p, LEVEL_SIZE*PRECISIONS)-1 downto min(((i+0)*PRECISIONS)+(2*LOGN), LEVEL_SIZE*PRECISIONS)-1) = 
-                    numout_level(l, logNceil(LEVEL_SIZE, N))(min(((i+1)*PRECISIONS)+(2*LOGN)+p, LEVEL_SIZE*PRECISIONS)-1 downto min(((i+1)*PRECISIONS)+(2*LOGN), LEVEL_SIZE*PRECISIONS)-1)) and
-                (numout_level(l, logNceil(LEVEL_SIZE, N))((min(((i+1)*PRECISIONS)+(2*LOGN)+p, LEVEL_SIZE*PRECISIONS)-1)) /= 
-                    numout_level(l, logNceil(LEVEL_SIZE, N))((min(((i+0)*PRECISIONS)+(2*LOGN)+p, LEVEL_SIZE*PRECISIONS)-1))) and 
-                (numout_level(l, logNceil(LEVEL_SIZE, N))(min(((i+0)*PRECISIONS)+(2*LOGN)+p, LEVEL_SIZE*PRECISIONS)-1) = '0')) then
-                    sorted_start_level(l, get_nid(l, i)) <= i;
-                    sorted_end_level(l, max(0, get_nid(l,i)-1)) <= i;
-               end if;
-               if ((sorted_end_level(l, get_nid(l,i))>sorted_start_level(l, get_nid(l,i)) and 
-                         sorted_end_level(l, max(0,get_nid(l,i)-1))>sorted_start_level(l, max(0,get_nid(l,i)-1)))) then
-                   if (p > P_COMPUTABLE and n_address(l, get_nid(l,i)) = 0) then
-                        --create new node
-                         req_wr_en(get_nid(l,i)) <= '1';
-                         n_address(l, get_nid(l,i)) <= total_count;
-                   elsif n_address(l, get_nid(l,i)) > 0 and (req_data(get_nid(l,i))((3*W_ADDR-(p-P_COMPUTABLE)-1)) /= 
-                        numout_level(l, logNceil(LEVEL_SIZE, N))((i*PRECISIONS) mod LEVEL_SIZE) or 
-                        p >= P+N_LEVELS-1) then
-                         -- update existing node count and create new node
-                         n_address(l, get_nid(l,i)) <= total_count;
-                   end if;
-               end if;
-             end if;
-          end loop;
+            if l = 0 then nid_bits := 0;
+            elsif l < LOGN then nid_bits := l;
+            else nid_bits := LOGN;
+            end if;
+            for nid in 0 to LEVEL_SIZE-1 loop
+                v_start := LEVEL_SIZE; v_end := 0;
+                if l = 0 then
+                    if nid = 0 then v_start := 0; v_end := LEVEL_SIZE; end if;
+                else
+                    for i in 0 to LEVEL_SIZE-1 loop
+                        nid_raw := numout_level(l, 1)(i*PRECISIONS+LOGN-1 downto i*PRECISIONS);
+                        for b in 0 to LOGN-1 loop
+                            if b >= nid_bits then nid_raw(b) := '0'; end if;
+                        end loop;
+                        nid_i := to_integer(unsigned(nid_raw));
+                        if nid_i = nid then
+                            if i < v_start then v_start := i; end if;
+                            if i+1 > v_end  then v_end   := i+1; end if;
+                        end if;
+                    end loop;
+                end if;
+                sorted_start_level(l, nid) <= v_start;
+                sorted_end_level(l, nid)   <= v_end;
+            end loop;
         end loop;
     end process;
     
     
+    -- ff_cd_shards: counter + filter circuit.
+    --
+    -- Counter: for each (level l, node pos), count how many entries i in
+    --   [sorted_start_level(l,pos), sorted_end_level(l,pos)) have d_p(i)=0
+    --   and how many have d_p(i)=1.
+    --
+    -- Filter (prefix sum): split_level(l,pos) = sorted_start_level(l,pos)
+    --   + node_zeros(l,pos) is the boundary between the 0-group and 1-group
+    --   within the sorted node window.
+    --
+    -- Synthesis note: the generate loop instantiates one process per (l,pos)
+    -- pair.  Every signal write uses the generate-time constants l and pos as
+    -- indices, so all assignments elaborate to FIXED addresses — no variable-
+    -- indexed writes and no mux explosion.
+    -- Combinational: split_level always tracks the current numout_level(l,1)
+    -- so ff_dp_partition reads consistent data at the same clock edge.
     ff_cd_shards:
-    for s in 0 to N_SHARDS-1 generate
-      ff_shifters:
-      for l in 0 to N_LEVELS-2 generate
-        ff_shift_level:
-        for i in 0 to LEVEL_SIZE-2 generate
-            ff_cd_prefix_sum: process (clk, sorted_end_level, sorted_start_level, n_address,
-                numout_level(l, logNceil(LEVEL_SIZE, N))((i+1)*PRECISIONS-1 downto i*PRECISIONS)) --,
-                --sorted_node_ids(l, i), sorted_node_ids(l, i+1))
-                alias level: std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0) is numout_level(l, logNceil(LEVEL_SIZE, N));
-                variable node_id: integer := max(0, min(LEVEL_SIZE-1, to_integer(unsigned(level(i*PRECISIONS+2*LOGN-1 downto i*PRECISIONS+LOGN)))));
-                variable entry_id: integer := to_integer(unsigned(level(i*PRECISIONS+LOGN-1 downto i*PRECISIONS)));
-                variable entry_id1: integer := to_integer(unsigned(level((i+1)*PRECISIONS+LOGN-1 downto (i+1)*PRECISIONS)));
-                variable parent_id: integer := node_id / 2;
-                variable p: integer := P+l; -- mod (PRECISIONS/2);
-                variable p_comp: integer := max(P_COMPUTABLE, P);
-                variable start: integer := start_pos(parent_id);
-                variable old_count: integer := 0;
-                variable old_count1: integer := 0;
-                --variable countl: integer := sorted_end_level(l, node_id)-sorted_start_level(l, node_id);
-                --variable countr: integer := sorted_end_level(l, node_id-1)-sorted_start_level(l, node_id-1);
-                variable n_addr: tuple := get_addr(node_id, LEVEL_SIZE); -- when p<32 else (n_address(l, node_id), W_ADDR);
-                variable n_val: std_logic_vector(2*W_ADDR-1 downto 0) := 
-                    ram(n_addr(0)/W_ADDR) & ram(((n_addr(0)/W_ADDR)+1) mod RAM_LEN);
-                variable non_comp_naddr : integer := n_address(l, node_id);
-                variable s: natural := n_addr(0) mod W_ADDR; 
-                variable w: natural := n_addr(1);
-                variable countn: integer := (sorted_end_level(l, node_id)-sorted_start_level(l, node_id));
-                variable countl: integer := (sorted_end_level(l, node_id)-sorted_start_level(l, node_id)) * 2**(2*W_ADDR-(s+w));
-                variable countr: integer := (sorted_end_level(l, max(0,node_id-1))-sorted_start_level(l, max(0,node_id-1))) * 2**(2*W_ADDR-(s+w));
-                -- Need to fix the width and alignment of countv to match `s`
-                variable countv: std_logic_vector(2*W_ADDR-1 downto 0) := std_logic_vector(to_unsigned(countl, 2*W_ADDR));
-                variable new_count: std_logic_vector(2*W_ADDR-1 downto 0) := 
-                    std_logic_vector(to_unsigned(to_integer(unsigned(n_val)) + countl, 2*W_ADDR));
-                variable total_count: integer := to_integer(unsigned(ram(0))); -- TODO: Align counter width
-                --variable b0: std_logic_vector(0 downto 0) := "1" when P < RAW_PRECISION else "0";
-                variable i1p: integer := min(((i+1)*PRECISIONS)+(2*LOGN)+p, LEVEL_SIZE*PRECISIONS);
-                variable i0p: integer := min(((i+0)*PRECISIONS)+(2*LOGN)+p, LEVEL_SIZE*PRECISIONS);
-                variable i1: integer := min(((i+1)*PRECISIONS)+(2*LOGN), LEVEL_SIZE*PRECISIONS);
-                variable i0: integer := min(((i+0)*PRECISIONS)+(2*LOGN), LEVEL_SIZE*PRECISIONS);
+    for l in 0 to N_LEVELS-2 generate
+        shards_pos: for pos in 0 to LEVEL_SIZE-2 generate
+            process(numout_level, sorted_start_level, sorted_end_level)
+                constant KEY_BIT : integer := KEY_OFFSET + (l mod (PRECISIONS - KEY_OFFSET));
+                variable n_z : integer range 0 to LEVEL_SIZE;
             begin
-            if (rising_edge(clk) and (level(i0p-1 downto i0-1) = level(i1p-1 downto i1-1)) and
-                    (level((i1p-1)) /= level((i0p-1))) and 
-                    (level(i0p-1) = '0') and (sorted_start_level1(node_id) /= i)) then
-                    --sorted_start_level1(node_id) <= i;
-                    --sorted_start_level(l, node_id) <= i; -- sorted_node_ids(s, l, i)) <= i;
-                    --sorted_end_level(l, max(0,node_id-1)) <= i; --sorted_node_ids(s, l, i+1)) <= i;
-                end if;
-                
-                
-                if (rising_edge(clk)) then -- and i>=sorted_start_level(l, node_id) and i<sorted_start_level(l, node_id+1)) then
-                    if ((sorted_end_level(l, node_id)>sorted_start_level(l, node_id) and 
-                         sorted_end_level(l, max(0,node_id-1))>sorted_start_level(l, max(0,node_id-1)))) then -- or (p >= P+N_LEVELS-1))) then
-                      if (p < P_CACHE or DATASET_SIZE < 2**29) then 
-                        ram((n_addr(0) / W_ADDR) mod RAM_LEN) <= new_count(2*W_ADDR-1 downto W_ADDR);
-                        ram(((n_addr(0) / W_ADDR)+1) mod RAM_LEN) <= new_count(W_ADDR-1 downto 0);
-                      elsif (p < P_COMPUTABLE or DATASET_SIZE < 2**32) then
-                            req_re_en(node_id) <= '1';
-                            req_addr(node_id) <= std_logic_vector(to_unsigned(n_addr(0) / W_ADDR, 32));
-                            req_data(node_id*2) <= countv;     
-                      elsif (n_address(l, node_id) = 0) then
-                        --create new node
-                         req_wr_en(node_id) <= '1';
-                         --n_address(l, node_id) <= total_count;
-                         req_addr(node_id) <= std_logic_vector(to_unsigned(total_count, 32));
-                         req_data(node_id) <= std_logic_vector(to_unsigned(countn, W_ADDR)) &
-                             level(i*PRECISIONS+p downto i*PRECISIONS+p_comp) & ((N_LEVELS-p)+(2*W_ADDR)-4 downto 0 => '0'); --count, identifier, left, right
-                         --req_valid(i) <= '1';
-                      elsif n_address(l, node_id) > 0 and req_data(node_id)(3*W_ADDR-(p-P_COMPUTABLE)-1) = level(i*PRECISIONS) then
-                         --update existing node count
-                         req_re_en(node_id) <= '1';
-                         req_addr(node_id) <= std_logic_vector(to_unsigned(n_address(l, node_id), 32));
-                         req_data(node_id) <= std_logic_vector(to_unsigned(countn, W_ADDR));
-                      elsif n_address(l, node_id) > 0 and (req_data(node_id)(3*W_ADDR-(p-P_COMPUTABLE)-1) /= level(i*PRECISIONS) or
-                                                           p >= P+N_LEVELS-1) then
-                         -- update existing node count and create new node
-                         req_re_en(node_id) <= '1';
-                         req_addr(node_id) <= std_logic_vector(to_unsigned(non_comp_naddr, 32));
-                         req_data(node_id) <= std_logic_vector(to_unsigned(countn, W_ADDR));
-                         --n_address(l, node_id) <= 0; --total_count;                        
-                      end if;
+                n_z := 0;
+                for i in 0 to LEVEL_SIZE-1 loop
+                    if i >= sorted_start_level(l, pos) and
+                       i <  sorted_end_level(l, pos) and
+                       numout_level(l, 1)(i*PRECISIONS + KEY_BIT) = '0' then
+                        n_z := n_z + 1;
                     end if;
-                    if l < N_LEVELS-1 and (i < sorted_end_level(l, node_id)) and (i>=sorted_start_level(l, node_id)) then
-                      --numout_level(l+1, 0)(start_pos(node_id) + (i-sorted_start_level(l, node_id))) <= level(i);
-                    end if;
-                end if;
-                
-                
-            end process;
-                        
-            --start_pos(l+1, i) <= start_pos(l, i) + (sorted_end_level(l, 0)-sorted_start_level(l, 0)); --node_ids(l, i)));
-            --node_ids(l+1, i) <= node_ids(l, i)*2 + 1 
-                --when (sorted_end_level(l, node_ids(l, i))-sorted_start_level(l, node_ids(l, i))) > (i-start_pos(l,i)) else node_ids(l, i)*2;
-                --when (sorted_end_level(l, 0)-sorted_start_level(l, 0)) > (i-start_pos(l,i)) else node_ids(l, i)*2;
-            --numout_p(i-start_pos(l+1, i) + sorted_start_level(l, node_ids(l, i))) <= 
-            --numout_p(i-start_pos(l+1, i) + sorted_start_level(l, 0)) <= 
-                --numout_level(0)(i-start_pos(l+1, i) + sorted_start_level(l, node_ids(l, i)));
-                --numout_level(N_SHARDS-1, 0)(i-start_pos(l+1, i) + sorted_start_level(l, 0));
-                
-                
-            --numout_p(i-start_pos(l+1, i) + sorted_start_level(l, 0)) <= 
-            --    --numout_level(0)(i-start_pos(l+1, i) + sorted_start_level(l, node_ids(l, i)));
-            --    numout_level(N_SHARDS-1, 0)(i-start_pos(l+1, i) + sorted_start_level(l, 0));
-        end generate ff_shift_level;
-        
-        
-        counts0: for i in 0 to LEVEL_SIZE-1 generate
-            --node_count(l, 0, i) <= 0 when numout_level(l, logNceil(LEVEL_SIZE, N)-1)(i*PRECISIONS+PRECISIONS/2-1) = '0' else 1;
-            node_count(l, 0, i) <= 0 when numout_level(l, 0)(i*PRECISIONS+PRECISIONS/2-1) = '0' else 1;
-        end generate counts0;   
-        
-        
-        gen_levels :
-        for lc in 1 to logNceil(LEVEL_SIZE, N) generate
-          -- Nodes at level l
-          --gen_nodes:
-          --for n in 0 to (N**(lc-1))-1 generate
-          gen_nodes: for n in 0 to 0 generate --(LEVEL_SIZE / (N**lc)) - 1 generate
-          
-            -- N is the base (8)
-            -- SIZE is the total number of inputs
-            -- LOGNSIZE is ceil(log8(SIZE))
-            
-            -- Calculate how many nodes exist at this specific level
-            -- Level 1 has SIZE/8 nodes, Level 2 has SIZE/64, etc.
-                
-            -- Each node (n) at level (lc) is the sum of N children 
-            -- from level (lc-1)
-            process(node_count)
-                variable temp_sum : natural := 0;
-                variable B : natural := 8; --N;
-                variable start : natural := n*(B**lc) mod LEVEL_SIZE; 
-            begin
-                temp_sum := 0;
-                for i in 0 to B-1 loop --N-1 loop
-                    -- Indexing logic: 
-                    -- The 8 children of node 'n' are located at (n*8) through (n*8 + 7)
-                    --temp_sum := temp_sum + node_count(l, lc-1, start + (i*B**(lc-1))); --(n*N + i) mod LEVEL_SIZE);
-                    temp_sum := temp_sum + node_count(l, lc-1, (n*N + i) mod LEVEL_SIZE);
                 end loop;
-                
-                node_count(l, lc, n) <= temp_sum;
+                node_zeros(l, pos)  <= n_z;
+                node_ones(l, pos)   <= sorted_end_level(l, pos)
+                                    - sorted_start_level(l, pos) - n_z;
+                split_level(l, pos) <= sorted_start_level(l, pos) + n_z;
             end process;
-            
-            -- Same binary-tree aggregation as before
-            --fastcount_node:
-            --for b in 1 to LOGNSIZE-1 generate
-            --  innercount_node:
-            --  for c in 0 to N/(2**b)-1 generate
-            --    node_count(lc, (n+1) * 2*N - N/(2**(b-1)) + c) <= 
-            --        node_count(lc, (n+1) * 2*N - N/(2**(b-2)) + 2*c) + node_count(lc, (n+1) * N - N/(2**(b-2)) + 2*c+1); 
-            --  end generate innercount_node;
-            --end generate fastcount_node;
-    
-            
-            process(node_count)
-                variable temp_sum : natural := 0;
-                variable temp_sum1: natural := 0;
-                variable ncount : natural := 0;
-            begin
-                temp_sum := 0;
-                for i in 0 to N-1 loop
-                    temp_sum1 := (i+1)*(N**(lc-1)) - temp_sum + node_count(l, lc, (n*N) mod LEVEL_SIZE);
-                    ncount := (N**(lc-1)) - node_count(l, lc-1, (n*N + i) mod LEVEL_SIZE);
-                    -- Indexing logic: 
-                    -- The 8 children of node 'n' are located at (n*8) through (n*8 + 7)
-                    numout_level(l, lc)(temp_sum+node_count(l, lc-1, (n*N + i) mod LEVEL_SIZE) downto temp_sum) <= 
-                        numout_level(l, lc-1)(node_count(l, lc-1, (n*N + i) mod LEVEL_SIZE)+(n*(N**(lc-1)))*PRECISIONS downto (n*(N**(lc-1)))*PRECISIONS);
-                    numout_level(l,lc)(temp_sum1+ncount downto temp_sum1) <= 
-                        numout_level(l, lc-1)(((n+1)*(N**(lc-1)))*PRECISIONS-1 downto node_count(l, lc-1, (n*N + i) mod LEVEL_SIZE)+(n*(N**(lc-1)))*PRECISIONS);
-                    temp_sum := temp_sum + node_count(l, lc-1, (n*N + i) mod LEVEL_SIZE);
-                end loop;
-                
-            end process;
-            
-            --FastShifts_node:
-            --for c in 0 to integer(real(INPUT_SIZE) / real(N**lc))-1 generate 
-            --  numout_level(l, lc)((INPUT_SIZE / (N**lc) + c+1)*PRECISIONS-1 downto (INPUT_SIZE / (N**lc) + c)*PRECISIONS) <= 
-            --     numout_level(s, l+1)(8*(LEVEL_SIZE*PRECISIONS/N) + (c-get_base(8)) when node_count(s, l+1, (n+1+7) * 2*N - 1)>0 and c-get_base(8) <= counts(8) else
-            --     --node_level(s, l+1)(8*(LEVEL_SIZE*PRECISIONS/N) + (c-get_base(8)) when node_count(s, l+1, (n+1+7) * 2*N - 1)>0 and c-get_base(8) <= counts(8) else
-            --     --((INPUT_SIZE / (N**lc) + c+1)*PRECISIONS-1 downto (INPUT_SIZE / (N**lc) + c)*PRECISIONS => '0');
-            --end generate FastShifts_node;
-          end generate gen_nodes;
-    
-        end generate gen_levels;
-      end generate ff_shifters;
+        end generate shards_pos;
     end generate ff_cd_shards;
     
+    -- mem_update: clocked process that writes per-node sorted statistics to
+    -- external RAM via the req signals, one N_BKTS-slot group per node pos.
+    --   slot pos*N_BKTS+0 : write  node_zeros & node_ones  (zeros/ones count pair)
+    --   slot pos*N_BKTS+1 : read-back the same address for host accumulation
+    -- split_level and sorted_end are NOT stored separately: they are fully
+    -- derivable as sorted_start + node_zeros and sorted_start + node_zeros + node_ones.
+    -- The 0-child address pointer is written only on first-time node creation
+    -- (n_address = 0, p >= P_COMPUTABLE) — not yet implemented; requires
+    -- n_address tracking to be added.
+    -- Addressing uses get_addr(node_id, N) for tree-hierarchy RAM layout.
+    mem_update:
+    for pos in 0 to LEVEL_SIZE-2 generate
+        process(clk)
+        begin
+            if rising_edge(clk) then
+                -- Slot 0: write zeros + ones counts
+                req_addr(pos * N_BKTS + 0) <= std_logic_vector(
+                    to_unsigned(get_addr(pos, N)(0), 32));
+                req_data(pos * N_BKTS + 0) <=
+                    std_logic_vector(to_unsigned(node_zeros(N_LEVELS-2, pos), W_ADDR)) &
+                    std_logic_vector(to_unsigned(node_ones (N_LEVELS-2, pos), W_ADDR));
+                req_wr_en(pos * N_BKTS + 0) <= '1';
+                req_re_en(pos * N_BKTS + 0) <= '0';
+
+                -- Slot 1: read-back same address for host to accumulate across batches
+                req_addr(pos * N_BKTS + 1) <= std_logic_vector(
+                    to_unsigned(get_addr(pos, N)(0), 32));
+                req_data(pos * N_BKTS + 1) <= (others => '0');
+                req_wr_en(pos * N_BKTS + 1) <= '0';
+                req_re_en(pos * N_BKTS + 1) <= '1';
+            end if;
+        end process;
+    end generate mem_update;
+
+    -- ff_dp_partition: for each level l, reorder entries within each node
+    -- so that d_p=0 entries fill [sorted_start, split) and d_p=1 entries fill
+    -- [split, sorted_end), writing the result to numout_level(l+1, 0) which
+    -- becomes the input for the next pipeline stage.
+    --
+    -- Outer generate over l: one process per level, so numout_level(l+1,0)
+    -- has exactly one driver per level — no multi-driver conflict.
+    -- Inner j loop (0..LEVEL_SIZE-1) is unrolled to compile-time constants,
+    -- so every slice write has a fixed address — no mux explosion.
+    --
+    -- numout_level(0,0) is driven by fs_scatter (= numbers_p).
+    -- ff_dp_partition writes numout_level(l+1,0) after fs_scatter sorts each level.
+    -- ff_dp_partition: reorder entries within each node so d_p=0 entries fill
+    -- [sorted_start, split) and d_p=1 entries fill [split, sorted_end), writing
+    -- the result to numout_level(l+1, 0) for the next pipeline stage.
+    --
+    -- Generate over both l and j: 41*8=328 instances, each owning one output
+    -- slice — exactly one driver per (l+1, 0, j) with no multi-driver conflict.
+    --
+    -- Each process has two SEQUENTIAL (not nested) for loops:
+    --   1. pos loop (7 iters): find this j's node bounds → local variables
+    --   2. i   loop (8 iters): find the rank-th same-type entry in the node
+    -- Total: 7+8=15 iterations vs the naive 7*8=56 nested approach.
+    ff_dp_partition:
+    for l in 0 to N_LEVELS-2 generate
+        part_j: for j in 0 to LEVEL_SIZE-1 generate
+            process(clk)
+                constant KEY_BIT : integer := KEY_OFFSET + (l mod (PRECISIONS - KEY_OFFSET));
+                variable v_start : integer range 0 to LEVEL_SIZE;
+                variable v_split : integer range 0 to LEVEL_SIZE;
+                variable v_end   : integer range 0 to LEVEL_SIZE;
+                variable rank    : integer range 0 to LEVEL_SIZE;
+                variable cnt     : integer range 0 to LEVEL_SIZE;
+                variable entry_i : std_logic_vector(PRECISIONS-1 downto 0);
+            begin
+                if rising_edge(clk) then
+                    -- Pass 1: find the node that owns output position j
+                    v_start := 0; v_split := 0; v_end := 0;
+                    for pos in 0 to LEVEL_SIZE-1 loop
+                        if j >= sorted_start_level(l, pos) and
+                           j <  sorted_end_level(l, pos) then
+                            v_start := sorted_start_level(l, pos);
+                            v_split := split_level(l, pos);
+                            v_end   := sorted_end_level(l, pos);
+                        end if;
+                    end loop;
+                    -- Rank of j within its type group (0s first)
+                    if j < v_split then
+                        rank := j - v_start;   -- 0-slot
+                    else
+                        rank := j - v_split;   -- 1-slot
+                    end if;
+                    -- Pass 2: find the rank-th same-type entry within the node
+                    -- Key bit read directly from entry; no d_p port needed
+                    entry_i := (others => '0');
+                    cnt := 0;
+                    for i in 0 to LEVEL_SIZE-1 loop
+                        if i >= v_start and i < v_end then
+                            if (j < v_split and numout_level(l, 1)(i*PRECISIONS + KEY_BIT) = '0') or
+                               (j >= v_split and numout_level(l, 1)(i*PRECISIONS + KEY_BIT) = '1') then
+                                if cnt = rank then
+                                    entry_i := numout_level(l, 1)
+                                        ((i+1)*PRECISIONS-1 downto i*PRECISIONS);
+                                end if;
+                                cnt := cnt + 1;
+                            end if;
+                        end if;
+                    end loop;
+                    -- Record which group this output slot belongs to (0=zeros, 1=ones).
+                    -- Bit l of entry encodes the node ID bit for level l (for l < LOGN).
+                    if l < LOGN then
+                        if j < v_split then
+                            entry_i(l) := '0';
+                        else
+                            entry_i(l) := '1';
+                        end if;
+                    end if;
+                    numout_level(l+1, 0)((j+1)*PRECISIONS-1 downto j*PRECISIONS) <= entry_i;
+                end if;
+            end process;
+        end generate part_j;
+    end generate ff_dp_partition;
+
+    numout_p <= numout_level(N_LEVELS-1, 1);  -- final barrel-sorted output of last stage
+
+    -- ram_update disabled: variable-indexed writes to 65536-entry ram cause synthesis explosion
+    -- ram_update: process(clk) ... end process ram_update;
+
+    -- Combinational N_LEVELS-stage radix sort pipeline.
+    -- Uses local variables to chain stages (signal reads within a process see
+    -- the pre-process value, so variables are required for cascaded levels).
+    -- Fixed-index writes only: after loop unrolling, every numout_level(l,vc)
+    -- assignment has a static address, avoiding mux-explosion.
+    --
+    -- fs_count: combinational, one process per l.
+    -- Computes fs_total_ones(l) = number of 1-entries in numout_level(l,0)
+    -- at KEY_BIT(l). Shared across all j-instances of fs_scatter to avoid
+    -- duplicating the count loop LEVEL_SIZE times per level.
+    fs_count:
+    for l in 0 to N_LEVELS-1 generate
+        process(numout_level)
+            constant KEY_BIT : integer := KEY_OFFSET + (l mod (PRECISIONS - KEY_OFFSET));
+            variable cnt : integer range 0 to LEVEL_SIZE;
+        begin
+            cnt := 0;
+            for i in 0 to LEVEL_SIZE-1 loop
+                if numout_level(l, 0)(i*PRECISIONS + KEY_BIT) = '1' then
+                    cnt := cnt + 1;
+                end if;
+            end loop;
+            fs_total_ones(l) <= cnt;
+        end process;
+    end generate fs_count;
+
+    -- fs_scatter: clocked, one process per (l,j).
+    -- Uses shared fs_total_ones(l) (2 scan loops, no count loop duplication).
+    -- 0-entries mapped to positions 0..total_zeros-1,
+    -- 1-entries mapped to positions total_zeros..LEVEL_SIZE-1.
+
+    -- Stage-0 input: register raw numbers input
     numout_level(0, 0) <= numbers_p;
-    
-    numout_p <= numout_level(N_LEVELS-1, 0);
-	
+
+    fs_scatter:
+    for l in 0 to N_LEVELS-1 generate
+        fs_j: for j in 0 to LEVEL_SIZE-1 generate
+            process(clk)
+                constant KEY_BIT : integer := KEY_OFFSET + (l mod (PRECISIONS - KEY_OFFSET));
+                variable cnt     : integer range 0 to LEVEL_SIZE;
+                variable entry_i : std_logic_vector(PRECISIONS-1 downto 0);
+            begin
+                if rising_edge(clk) then
+                    entry_i := (others => '0');
+                    -- Pass 1: find the j-th 0-entry
+                    cnt := 0;
+                    for i in 0 to LEVEL_SIZE-1 loop
+                        if numout_level(l, 0)(i*PRECISIONS + KEY_BIT) = '0' then
+                            if cnt = j then
+                                entry_i := numout_level(l, 0)
+                                    ((i+1)*PRECISIONS-1 downto i*PRECISIONS);
+                            end if;
+                            cnt := cnt + 1;
+                        end if;
+                    end loop;
+                    -- Pass 2: find the (j - total_zeros)-th 1-entry
+                    cnt := 0;
+                    for i in 0 to LEVEL_SIZE-1 loop
+                        if numout_level(l, 0)(i*PRECISIONS + KEY_BIT) = '1' then
+                            if cnt = j - (LEVEL_SIZE - fs_total_ones(l)) then
+                                entry_i := numout_level(l, 0)
+                                    ((i+1)*PRECISIONS-1 downto i*PRECISIONS);
+                            end if;
+                            cnt := cnt + 1;
+                        end if;
+                    end loop;
+                    numout_level(l, 1)((j+1)*PRECISIONS-1 downto j*PRECISIONS) <= entry_i;
+                end if;
+            end process;
+        end generate fs_j;
+    end generate fs_scatter;
+
+
+    mem_req_arbiter: process(clk)
+        -- Round-robin over all N_BKTS*LEVEL_SIZE-1 request slots.
+        -- Sends one request per cycle unconditionally (fire-and-forget for writes;
+        -- reads are also pipelined). The outer arbiter in fractal.vhd rate-limits
+        -- forwarding via fifo_ready, but we don't block here — that way the
+        -- inner req_turn advances every cycle and cycles through all node slots.
+        constant N_SLOTS : integer := N_BKTS * LEVEL_SIZE - 1;
+        variable next_s  : integer range 0 to N_BKTS*LEVEL_SIZE-2;
+        variable found   : boolean;
+    begin
+        if rising_edge(clk) then
+            fifo_wr_en <= '0';
+            fifo_re_en <= '0';
+            fifo_dw    <= (others => '0');
+            found := false;
+            for i in 0 to N_BKTS*LEVEL_SIZE-2 loop
+                next_s := (req_turn + i) mod N_SLOTS;
+                if not found then
+                    if req_wr_en(next_s) = '1' then
+                        fifo_wr_en <= '1';
+                        fifo_dw    <= req_addr(next_s) & req_data(next_s);
+                        req_turn   <= (next_s + 1) mod N_SLOTS;
+                        found      := true;
+                    elsif req_re_en(next_s) = '1' then
+                        fifo_re_en <= '1';
+                        fifo_dw    <= req_addr(next_s) & req_data(next_s);
+                        req_turn   <= (next_s + 1) mod N_SLOTS;
+                        found      := true;
+                    end if;
+                end if;
+            end loop;
+        end if;
+    end process;
+
+    -- Drive count from pipeline output + shard counters so neither block is
+    -- optimized away (count feeds child_counts in fractal.vhd).
+    count <= to_integer(unsigned(numout_level(N_LEVELS-1, 1)(LOGN-1 downto 0)))
+           + node_zeros(0, 0);
+
+    -- Diagnostic: print key pipeline signals every 20 cycles
+    -- End-to-end sort check: print full key value (bits 7..48) of each entry
+    -- at L0 input and L41 output. Repeated every 50 cycles to see multiple batches.
+    diagnostic: process(clk)
+        variable l_out   : line;
+        variable sim_cyc : integer := 0;
+        variable prev_val : integer;
+        variable cur_val  : integer;
+        variable sorted   : boolean;
+    begin
+        if rising_edge(clk) then
+            sim_cyc := sim_cyc + 1;
+            if sim_cyc mod 50 = 0 then
+                -- L0 input: what went in (top 31 key bits: 48 downto 18, fits in integer)
+                write(l_out, string'("[cyc=" & integer'image(sim_cyc) & "] INPUT :"));
+                for i in 0 to LEVEL_SIZE-1 loop
+                    write(l_out, string'( integer'image(to_integer(unsigned(
+                        numout_level(0,0)(i*PRECISIONS+48 downto i*PRECISIONS+18)))) & " "));
+                end loop;
+                writeline(output, l_out);
+                -- L41 output: what came out
+                write(l_out, string'("[cyc=" & integer'image(sim_cyc) & "] OUTPUT:"));
+                for i in 0 to LEVEL_SIZE-1 loop
+                    write(l_out, string'( integer'image(to_integer(unsigned(
+                        numout_level(N_LEVELS-1,1)(i*PRECISIONS+48 downto i*PRECISIONS+18)))) & " "));
+                end loop;
+                writeline(output, l_out);
+                -- Check if output is non-decreasing (using same 31-bit window)
+                sorted := true;
+                prev_val := 0;
+                for i in 0 to LEVEL_SIZE-1 loop
+                    cur_val := to_integer(unsigned(
+                        numout_level(N_LEVELS-1,1)(i*PRECISIONS+48 downto i*PRECISIONS+18)));
+                    if cur_val < prev_val then sorted := false; end if;
+                    prev_val := cur_val;
+                end loop;
+                if sorted then
+                    write(l_out, string'("[cyc=" & integer'image(sim_cyc) & "] SORTED: YES"));
+                else
+                    write(l_out, string'("[cyc=" & integer'image(sim_cyc) & "] SORTED: NO"));
+                end if;
+                writeline(output, l_out);
+            end if;
+        end if;
+    end process;
+
 end Behavioral;

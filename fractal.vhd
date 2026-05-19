@@ -40,7 +40,7 @@ entity fractal is
 			  --d : in std_logic_vector(LEVEL_SIZE-1 downto 0) := (LEVEL_SIZE-1 downto 0 => '0');
 			  --numbers : in std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0) := (LEVEL_SIZE*PRECISIONS-1 downto 0 => '0');
 	
-	        d_p : in std_logic_vector(LEVEL_SIZE-1 downto 0) := (LEVEL_SIZE-1 downto 0 => '0');
+	        raw_numbers_in : in std_logic_vector(LEVEL_SIZE*RAW_PRECISION-1 downto 0) := (others => '0');
 --			  numbers_p : in std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0) := (LEVEL_SIZE*PRECISIONS-1 downto 0 => '0');
 --			  --levels_p : in std_logic_vector(N_LEVELS*INPUT_SIZE*PRECISIONS-1 downto 0) := (N_LEVELS*INPUT_SIZE*PRECISIONS-1 downto 0 => '0');
 --			  path : inout std_logic_vector(PRECISIONS-1 downto 0) := '1' & (PRECISIONS-2 downto 0 => '0');
@@ -181,7 +181,7 @@ architecture Behavioral of fractal is
     signal    fifo_readys: std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
 	signal    fifo_dins: slv_fifo_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
 	signal    fifo_douts: slv_fifo_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
-	signal turn: integer := 0;
+	signal turn: integer range 1 to N_FF_LEVELS-N_BASE_LEVELS := 1;
 	
     signal raw_numbers : slv_inp_arr(0 to RAW_PRECISION-1) := (others => (others => '0'));
 	signal one : std_logic_vector(PRECISIONS-1 downto 0) := '1' & (PRECISIONS-2 downto 0 => '0');
@@ -204,6 +204,7 @@ architecture Behavioral of fractal is
 	signal fifo_qhead: integer := 0;
     signal fifo_qtail: integer := 0;
     signal fifo_q : count_1d_t(0 to N_BKTS*LEVEL_SIZE) := (others => 0);
+	signal child_counts : count_1d_t(1 to N_FF_LEVELS-N_BASE_LEVELS) := (others => 0);
 	
 	--impure function equal(a : std_logic_vector; b : std_logic_vector) return std_logic is
 	  --  variable av : std_logic_vector(a'length-1 downto 0) := a;
@@ -232,11 +233,13 @@ architecture Behavioral of fractal is
 		
 			Levels:
 			for l in 1 to N_FF_LEVELS-N_BASE_LEVELS generate
-			    input_row: for lc in 1 to (RAW_PRECISION/N_FF_LEVELS)-1 generate
+			    input_row: for lc in 0 to (RAW_PRECISION/N_FF_LEVELS)-1 generate
 			         input_entry: for j in 0 to INPUT_SIZE-1 generate
-			             level_p(l)(((j+1)*PRECISIONS)-1-(RAW_PRECISION/N_FF_LEVELS)+lc) <= 
-			                 raw_numbers(((l-1)*(RAW_PRECISION/N_FF_LEVELS))-1+lc)
-			                     (((j+1)*PRECISIONS)-1-(RAW_PRECISION/N_FF_LEVELS)+lc);
+			             -- Dest: key bit lc of entry j in level_p (bits KEY_OFFSET..KEY_OFFSET+41)
+			             -- Src:  bit lc of raw entry j in the time-delayed snapshot
+			             level_p(l)(j*PRECISIONS + (2*LOGN+1) + lc) <=
+			                 raw_numbers((l-1)*(RAW_PRECISION/N_FF_LEVELS)+lc)
+			                     (j*RAW_PRECISION + lc);
 			         end generate input_entry;
 			    end generate input_row;
 				
@@ -261,7 +264,6 @@ architecture Behavioral of fractal is
 								generic map( LEVEL_SIZE => INPUT_SIZE, N_FF_NODES => N**l, FF_LEVEL_SIZE => LEVEL_SIZE/(N**l),
 								             P => (l-1)*(RAW_PRECISION/N_FF_LEVELS) ) 
 							port map (clk, reset => reset, 
-									  d_p => d_p, 
 									  numbers_p => level_p(l), --levels_p((0+1)*PRECISIONS*INPUT_SIZE-1 downto 0*PRECISIONS*INPUT_SIZE),
 									  start => 0, stop => INPUT_SIZE, starts_p => ZERO_STARTS(l),
 									  --sorted_p => dout_p, --((p+1)*INPUT_SIZE-1 downto p*INPUT_SIZE),
@@ -269,6 +271,7 @@ architecture Behavioral of fractal is
 									  --startout_p => ZERO_STARTS(l+1),
 									  --numout_p => level_p(l)((p+1)*INPUT_SIZE*PRECISIONS-1 downto p*INPUT_SIZE*PRECISIONS),
 									  startout_p => ZERO_STARTS(l),
+									  count => child_counts(l),
 									  fifo_wr_en => fifo_wr_ens(l),
 									  fifo_re_en => fifo_re_ens(l),
 									  fifo_dw => fifo_douts(l),
@@ -290,62 +293,61 @@ architecture Behavioral of fractal is
 		
 		
 	end generate GeneralFFCase;
-	
-	
+
+    -- Expose count from counter instance l=1 for monitoring
+    count <= child_counts(1);
+
     mem_arbiter: process(clk)
-        variable next_turn : integer range 0 to N_FF_LEVELS-N_BASE_LEVELS-2;
-        variable found     : boolean;
-        variable qtail     : integer := fifo_qtail;
-        variable qhead     : integer := fifo_qhead;
-        variable level     : integer := fifo_q(qhead);
+        -- Counter instances occupy indices 1 to N_FF_LEVELS-N_BASE_LEVELS.
+        -- Round-robin over that range using 'turn' (signal, range 1..max).
+        constant N_CNTRS : integer := N_FF_LEVELS - N_BASE_LEVELS;
+        variable next_t  : integer range 1 to N_FF_LEVELS-N_BASE_LEVELS;
+        variable found   : boolean;
+        variable level   : integer;
     begin
-        if rising_edge(clk) then    
+        if rising_edge(clk) then
+            -- Default: deassert outputs every cycle; driven below if a request is found
+            fifo_wr_en <= '0';
+            fifo_re_en <= '0';
             if fifo_ready = '1' then
-                fifo_dins(level) <= fifo_din;
-                fifo_readys(level) <= fifo_ready;
-                fifo_qhead <= (qhead + 1) mod (N_BKTS*LEVEL_SIZE);
+                -- Route read-data back to the counter that last made a request
+                level := turn;
+                fifo_dins(level)   <= fifo_din;
+                fifo_readys(level) <= '1';
             else
-                fifo_wr_en <= '0';
-                --req_ack    <= (others => '0');
-                found      := false;
-                -- Search for the next valid request starting from the CURRENT 'turn'
-                -- This loop is combinational; it "jumps" to the next valid requester in 1 cycle.
-                for i in 1 to N_FF_LEVELS-N_BASE_LEVELS-1 loop
-                    next_turn := (turn + i) mod (N_FF_LEVELS-N_BASE_LEVELS);
-                    if not found and (fifo_wr_ens(turn) = '1' or fifo_re_ens(turn) = '1') then --req_valid(next_turn) = '1' and not found then
-                        -- Drive outputs
-                        fifo_dout   <= fifo_douts(turn);
-                        if fifo_wr_ens(turn) = '1' then
-                            fifo_wr_en <= fifo_wr_ens(turn);
-                        else
-                            fifo_re_en <= fifo_re_ens(turn);
+                found := false;
+                -- Scan N_CNTRS slots starting at current turn (round-robin)
+                for i in 0 to N_FF_LEVELS-N_BASE_LEVELS-1 loop
+                    next_t := 1 + (turn - 1 + i) mod N_CNTRS;
+                    if not found then
+                        if fifo_wr_ens(next_t) = '1' then
+                            fifo_dout  <= fifo_douts(next_t);
+                            fifo_wr_en <= '1';
+                            turn <= 1 + (next_t mod N_CNTRS);
+                            found := true;
+                        elsif fifo_re_ens(next_t) = '1' then
+                            fifo_dout  <= fifo_douts(next_t);
+                            fifo_re_en <= '1';
+                            turn <= 1 + (next_t mod N_CNTRS);
+                            found := true;
                         end if;
-                        
-                        -- Handshake
-                        --req_ack(next_turn) <= '1';
-                        turn <= next_turn; -- Update current position for next time
-                        found := true;
                     end if;
                 end loop;
+                -- Always advance so we don't get stuck on an idle slot
+                if not found then
+                    turn <= 1 + (turn mod N_CNTRS);
+                end if;
             end if;
         end if;
     end process;
     
-	entry_loader: process (clk, reset) 
-        -- These variables stay "alive" between clock cycles
-        variable seed1 : positive := 98765; 
-        variable seed2 : positive := 43210; 
+	entry_loader: process (clk, reset)
     begin
         if rising_edge(clk) then
             if reset = '1' then
-                -- Optional: Re-seed on reset to make results repeatable
-                seed1 := 98765;
-                seed2 := 43210;
+                raw_numbers(0) <= (others => '0');
             else
-                -- Every call to this function updates seed1 and seed2
-                raw_numbers(0) <= generate_rand_set(LEVEL_SIZE, UNIFORM_DIST, seed1, seed2);
-                
-                -- Shifting logic...
+                raw_numbers(0) <= raw_numbers_in;
                 for i in 1 to RAW_PRECISION-1 loop
                     raw_numbers(i) <= raw_numbers(i-1);
                 end loop;
