@@ -32,11 +32,45 @@ PACKAGE reg24gen_package IS
 	CONSTANT PRECISIONS : INTEGER := 2*LOGN+43; --21; --PRECISION + SIZE_PRECISION;
 	CONSTANT BASE_INPUT_SIZE : INTEGER := 9;
 	CONSTANT DEVICE_PINS : INTEGER := 100; -- 550;
-    CONSTANT INPUT_SIZE : INTEGER := 1*N; --4*BASE_INPUT_SIZE; --8*8*8*9=4608; --depth*fanout*base_size --1152; --9216; --288/PRECISION;
+    CONSTANT INPUT_SIZE : INTEGER := N; --4*BASE_INPUT_SIZE; --8*8*8*9=4608; --depth*fanout*base_size --1152; --9216; --288/PRECISION;
     CONSTANT DATASET_SIZE: INTEGER := 2**28;
     CONSTANT W_ADDR : INTEGER := 16;
     CONSTANT RAM_LEN: INTEGER := (2**20) / W_ADDR; --(2**28) / W_ADDR;
     CONSTANT N_BKTS: INTEGER := 2;  -- slot 0: write zeros+ones count; slot 1: read-back for accumulation
+
+    -- Histogram constants
+    CONSTANT LC : INTEGER := 20;  -- max histogram level
+    CONSTANT NODE_LEVELS : INTEGER := log2ceil(INPUT_SIZE);  -- log2ceil(INPUT_SIZE)
+    CONSTANT KEY_WIDTH : INTEGER := 42;  -- PRECISIONS - (2*LOGN+1) = 49-7
+    CONSTANT HIST_DEPTH : INTEGER := 2097152;  -- 2^(LC+1)
+
+    -- Phase 1 scatter-bin constants
+    CONSTANT N_BINS : INTEGER := 8;  -- small for testing, target 1024-4096
+    CONSTANT BIN_ID_BITS : INTEGER := 3;  -- log2ceil(N_BINS)
+    CONSTANT BIN_ENTRY_WIDTH : INTEGER := KEY_WIDTH - BIN_ID_BITS;  -- trailing bits per entry
+    -- SRAM bin depth per bin (on-chip write buffer before HBM drain)
+    CONSTANT BIN_BUF_DEPTH : INTEGER := 64;  -- entries per bin buffer
+    CONSTANT BIN_BUF_ADDR_BITS : INTEGER := 6;  -- log2ceil(BIN_BUF_DEPTH)
+
+    -- Physical memory channel counts (stride for drain)
+    CONSTANT N_HBM_CHAN : INTEGER := 8;   -- HBM pseudo-channels drained per cc
+    CONSTANT N_DRAM_CHAN : INTEGER := 4;  -- DRAM channels
+    CONSTANT N_SSD_CHAN : INTEGER := 2;   -- SSD channels
+
+    -- HBM payload: 256 bits per pseudo-channel
+    CONSTANT HBM_PAYLOAD_BITS : INTEGER := 256;
+    CONSTANT HBM_ENTRIES_PER_PAYLOAD : INTEGER := HBM_PAYLOAD_BITS / BIN_ENTRY_WIDTH;
+
+    -- SRAM throttle: pause input when total bin occupancy exceeds this (in entries)
+    -- 256Mb / BIN_ENTRY_WIDTH bits per entry
+    CONSTANT SRAM_THROTTLE_ENTRIES : INTEGER := 256 * 1024 * 1024 / BIN_ENTRY_WIDTH;
+
+    -- Max entries per bin in HBM (address space reservation)
+    CONSTANT MAX_BIN_ENTRIES : INTEGER := DATASET_SIZE / N_BINS;
+
+    -- Pipeline latency: 2 clocked stages per level (fs_scatter + ff_dp_partition),
+    -- minus 1 since last level has no ff_dp_partition after it
+    CONSTANT PIPELINE_LATENCY : INTEGER := 2 * (RAW_PRECISION / log2ceil(INPUT_SIZE)) - 1;
 
     -- Function to generate a set of N random numbers
     impure function generate_rand_set(
@@ -232,7 +266,29 @@ entity counter is
 	          fifo_re_en: out std_logic;
 	          fifo_dw: out std_logic_vector(4*W_ADDR-1 downto 0);
 	          fifo_dr: in std_logic_vector(4*W_ADDR-1 downto 0);
-	          fifo_dready: in std_logic);
+	          fifo_dready: in std_logic;
+	          -- HBM controller interface
+	          hbm_wr_en : out std_logic;
+	          hbm_dout  : out std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+	          hbm_ready : in std_logic;
+	          -- DRAM controller interface
+	          dram_wr_en : out std_logic;
+	          dram_dout  : out std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+	          dram_ready : in std_logic;
+	          -- SSD controller interface
+	          ssd_wr_en : out std_logic;
+	          ssd_dout  : out std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+	          ssd_ready : in std_logic;
+	          -- Phase control
+	          phase1_complete : in std_logic;
+	          sort_complete : out std_logic;
+	          -- HBM write address (for both Phase 1 drain and Phase 2 write-back)
+	          hbm_wr_addr : out std_logic_vector(31 downto 0);
+	          -- HBM read interface (Phase 2 readback)
+	          hbm_rd_req  : out std_logic;
+	          hbm_rd_addr : out std_logic_vector(31 downto 0);
+	          hbm_rd_data : in std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+	          hbm_rd_valid : in std_logic);
 end counter;
 
 architecture Behavioral of counter is
@@ -333,20 +389,88 @@ architecture Behavioral of counter is
     signal node_ones   : count_2d_t(0 to N_LEVELS-1, 0 to LEVEL_SIZE-1) := (others => (others => 0));
     signal split_level : count_2d_t(0 to N_LEVELS-1, 0 to LEVEL_SIZE-1) := (others => (others => 0));
     signal fs_total_ones : count_1d_t(0 to N_LEVELS-1) := (others => 0);
-    signal ram : slv_ram_arr(0 to RAM_LEN-1) := (others => (others => '0'));
-    --signal n_address1 : count_1d_t(0 to N_BKTS*LEVEL_SIZE) := (others => 0);
-    signal req_addr  : addr_array(0 to N_BKTS*LEVEL_SIZE) := (others => (others => '0'));
-    signal req_data  : data_array(0 to N_BKTS*LEVEL_SIZE) := (others => (others => '0'));
-    signal req_valid : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
-    signal req_ack   : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
-    signal req_re_en : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
-    signal req_wr_en : std_logic_vector(0 to N_BKTS*LEVEL_SIZE-2) := (others => '0');
-	signal req_turn  : integer range 0 to N_BKTS*LEVEL_SIZE-2 := 0;
-	signal fifo_wr_ens: std_logic := '0';
-	signal fifo_re_ens: std_logic := '0';
-	signal fifo_dws: std_logic_vector(4*W_ADDR-1 downto 0) := (others => '0');
-    signal fifo_drs: std_logic_vector(4*W_ADDR-1 downto 0) := (others => '0');
-	signal fifo_dreadys: std_logic := '0';
+    -- Prefix sums: cumulative zeros/ones before each node (for ff_dp_partition)
+    signal zeros_before : count_2d_t(0 to N_LEVELS-1, 0 to LEVEL_SIZE-1) := (others => (others => 0));
+    signal ones_before  : count_2d_t(0 to N_LEVELS-1, 0 to LEVEL_SIZE-1) := (others => (others => 0));
+    -- Histogram memory (URAM-inferred)
+    type hist_mem_t is array (0 to HIST_DEPTH-1) of std_logic_vector(W_ADDR-1 downto 0);
+    signal hist_mem : hist_mem_t := (others => (others => '0'));
+    attribute ram_style : string;
+    attribute ram_style of hist_mem : signal is "ultra";
+
+    -- Histogram memory interface signals
+    signal hist_rd_addr : integer range 0 to HIST_DEPTH-1 := 0;
+    signal hist_rd_data : std_logic_vector(W_ADDR-1 downto 0) := (others => '0');
+    signal hist_wr_addr : integer range 0 to HIST_DEPTH-1 := 0;
+    signal hist_wr_data : std_logic_vector(W_ADDR-1 downto 0) := (others => '0');
+    signal hist_wr_en   : std_logic := '0';
+
+    -- Phase 1 SRAM bin buffers: N_BINS bins, each BIN_BUF_DEPTH entries deep
+    -- Implemented as a single URAM block addressed by (bin_id * BIN_BUF_DEPTH + offset)
+    constant BIN_SRAM_DEPTH : integer := N_BINS * BIN_BUF_DEPTH;  -- total SRAM entries
+    type bin_sram_t is array (0 to BIN_SRAM_DEPTH-1) of std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+    signal bin_sram : bin_sram_t := (others => (others => '0'));
+    attribute ram_style of bin_sram : signal is "ultra";
+
+    -- Per-bin write/read pointers and fill counts
+    type bin_ptr_t is array (0 to N_BINS-1) of integer range 0 to BIN_BUF_DEPTH-1;
+    type bin_cnt_t is array (0 to N_BINS-1) of integer range 0 to BIN_BUF_DEPTH;
+    signal bin_wr_ptr : bin_ptr_t := (others => 0);
+    signal bin_rd_ptr : bin_ptr_t := (others => 0);
+    signal bin_count  : bin_cnt_t := (others => 0);
+
+    -- Total SRAM occupancy for throttle
+    signal sram_total_entries : integer range 0 to BIN_SRAM_DEPTH := 0;
+    signal throttle_active : std_logic := '0';
+
+    -- Per-entry scatter: extract bin_id and trailing bits from each pipeline output
+    type scatter_bin_id_t is array (0 to LEVEL_SIZE-1) of integer range 0 to N_BINS-1;
+    type scatter_entry_t is array (0 to LEVEL_SIZE-1) of std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+    signal scatter_bin_ids : scatter_bin_id_t := (others => 0);
+    signal scatter_entries : scatter_entry_t := (others => (others => '0'));
+    signal scatter_valid   : std_logic_vector(LEVEL_SIZE-1 downto 0) := (others => '0');
+
+    -- Scatter write serializer: N entries per cc but SRAM has limited write ports
+    -- We serialize N writes over N sub-cycles using a write index
+    signal scatter_wr_idx : integer range 0 to LEVEL_SIZE-1 := 0;
+    signal scatter_pending : std_logic := '0';
+
+    -- HBM drain: round-robin with stride N_HBM_CHAN
+    signal drain_base : integer range 0 to N_BINS-1 := 0;  -- base bin for current drain window
+    signal drain_sub  : integer range 0 to N_HBM_CHAN-1 := 0;  -- sub-channel within window
+
+    -- Phase control
+    type phase_t is (PHASE1_SCATTER, PHASE1_FLUSH, PHASE2_SORT, PHASE_DONE);
+    signal phase : phase_t := PHASE1_SCATTER;
+
+    -- Phase 1 HBM write: per-bin entry counts for Phase 2 readback
+    type bin_hbm_cnt_t is array (0 to N_BINS-1) of integer range 0 to MAX_BIN_ENTRIES;
+    signal hbm_bin_wr_count : bin_hbm_cnt_t := (others => 0);
+
+    -- Phase 1/2 HBM output mux intermediates
+    signal p1_hbm_wr_en   : std_logic := '0';
+    signal p1_hbm_dout    : std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0) := (others => '0');
+    signal p1_hbm_wr_addr : std_logic_vector(31 downto 0) := (others => '0');
+    signal p2_hbm_wr_en   : std_logic := '0';
+    signal p2_hbm_dout    : std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0) := (others => '0');
+    signal p2_hbm_wr_addr : std_logic_vector(31 downto 0) := (others => '0');
+
+    -- Phase 2 state
+    type p2_state_t is (P2_IDLE, P2_REQ_READ, P2_WAIT_READ, P2_SORT_WAIT,
+                        P2_WRITE_OUT, P2_NEXT_BATCH, P2_NEXT_BIN, P2_DONE);
+    signal p2_state : p2_state_t := P2_IDLE;
+    signal p2_curr_bin : integer range 0 to N_BINS-1 := 0;
+    signal p2_read_idx : integer := 0;
+    signal p2_batch_fill : integer range 0 to LEVEL_SIZE := 0;
+    signal p2_batch_buf : std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0) := (others => '0');
+    signal p2_sort_count : integer range 0 to PIPELINE_LATENCY + 2 := 0;
+    signal p2_write_idx : integer range 0 to LEVEL_SIZE := 0;
+    signal p2_batch_valid : integer range 0 to LEVEL_SIZE := 0;  -- entries in current batch
+    signal p2_bin_write_count : integer := 0;
+    signal p2_finished : std_logic := '0';
+
+    -- Pipeline input mux
+    signal pipeline_input : std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0);
     
 
 
@@ -387,8 +511,8 @@ architecture Behavioral of counter is
 	signal tcount : integer := 0;
 	signal counts: level_logints := (LOGN-1 downto 0 => (N-1 downto 0 => 0));
 
-	signal starts : level_ints := (N-1 downto 0 => 0);
-	signal stops : level_ints := (N-1 downto 0 => 0);
+	signal starts : level_ints := (LEVEL_SIZE-1 downto 0 => 0);
+	signal stops : level_ints := (LEVEL_SIZE-1 downto 0 => 0);
 	signal icount : integer := 0;
 	
 	-- How many ffnode instances?
@@ -581,196 +705,288 @@ architecture Behavioral of counter is
 	begin
 		
 		
-    -- ff_cd_node_ids: single combinational process.
-    -- Node ID grows with l: bits min(l,LOGN)-1..0 hold the node address.
-    -- Reads LOGN bits, masks off bits above min(l,LOGN)-1 at runtime.
+    -- ff_cd_node_ids: transition-detection approach.
+    -- Nodes are contiguous after fs_scatter, so we only need to detect where
+    -- the node ID changes between adjacent entries.  Cost: LEVEL_SIZE
+    -- comparators per level instead of LEVEL_SIZE^2.
     ff_cd_node_ids: process(numout_level)
-        variable nid_raw  : std_logic_vector(LOGN-1 downto 0);
-        variable nid_i    : integer range 0 to LEVEL_SIZE-1;
-        variable v_start  : integer;
-        variable v_end    : integer;
-        variable nid_bits : integer range 0 to LOGN;
+        variable nid_raw, prev_nid_raw : std_logic_vector(LOGN-1 downto 0);
+        variable nid_i, prev_nid_i     : integer range 0 to LEVEL_SIZE-1;
+        variable nid_bits              : integer range 0 to LOGN;
+        variable cur_start             : integer range 0 to LEVEL_SIZE;
     begin
+        -- Default: all nodes empty (start=LEVEL_SIZE, end=0)
         for l in 0 to N_LEVELS-2 loop
-            if l = 0 then nid_bits := 0;
-            elsif l < LOGN then nid_bits := l;
-            else nid_bits := LOGN;
-            end if;
             for nid in 0 to LEVEL_SIZE-1 loop
-                v_start := LEVEL_SIZE; v_end := 0;
-                if l = 0 then
-                    if nid = 0 then v_start := 0; v_end := LEVEL_SIZE; end if;
-                else
-                    for i in 0 to LEVEL_SIZE-1 loop
-                        nid_raw := numout_level(l, 1)(i*PRECISIONS+LOGN-1 downto i*PRECISIONS);
-                        for b in 0 to LOGN-1 loop
-                            if b >= nid_bits then nid_raw(b) := '0'; end if;
-                        end loop;
-                        nid_i := to_integer(unsigned(nid_raw));
-                        if nid_i = nid then
-                            if i < v_start then v_start := i; end if;
-                            if i+1 > v_end  then v_end   := i+1; end if;
-                        end if;
-                    end loop;
-                end if;
-                sorted_start_level(l, nid) <= v_start;
-                sorted_end_level(l, nid)   <= v_end;
+                sorted_start_level(l, nid) <= LEVEL_SIZE;
+                sorted_end_level(l, nid)   <= 0;
             end loop;
+        end loop;
+
+        for l in 0 to N_LEVELS-2 loop
+            if l = 0 then
+                -- Level 0: single node spanning entire array
+                sorted_start_level(0, 0) <= 0;
+                sorted_end_level(0, 0)   <= LEVEL_SIZE;
+            else
+                if l < LOGN then nid_bits := l;
+                else nid_bits := LOGN;
+                end if;
+
+                -- Get node ID of first entry
+                prev_nid_raw := numout_level(l, 1)(LOGN-1 downto 0);
+                for b in 0 to LOGN-1 loop
+                    if b >= nid_bits then prev_nid_raw(b) := '0'; end if;
+                end loop;
+                prev_nid_i := to_integer(unsigned(prev_nid_raw));
+                cur_start := 0;
+
+                -- Scan entries 1..LEVEL_SIZE-1: detect transitions
+                for i in 1 to LEVEL_SIZE-1 loop
+                    nid_raw := numout_level(l, 1)(i*PRECISIONS+LOGN-1 downto i*PRECISIONS);
+                    for b in 0 to LOGN-1 loop
+                        if b >= nid_bits then nid_raw(b) := '0'; end if;
+                    end loop;
+                    nid_i := to_integer(unsigned(nid_raw));
+
+                    if nid_i /= prev_nid_i then
+                        -- Close previous node, open new one
+                        sorted_start_level(l, prev_nid_i) <= cur_start;
+                        sorted_end_level(l, prev_nid_i)   <= i;
+                        cur_start := i;
+                        prev_nid_i := nid_i;
+                    end if;
+                end loop;
+
+                -- Close last node
+                sorted_start_level(l, prev_nid_i) <= cur_start;
+                sorted_end_level(l, prev_nid_i)   <= LEVEL_SIZE;
+            end if;
         end loop;
     end process;
     
     
-    -- ff_cd_shards: counter + filter circuit.
-    --
-    -- Counter: for each (level l, node pos), count how many entries i in
-    --   [sorted_start_level(l,pos), sorted_end_level(l,pos)) have d_p(i)=0
-    --   and how many have d_p(i)=1.
-    --
-    -- Filter (prefix sum): split_level(l,pos) = sorted_start_level(l,pos)
-    --   + node_zeros(l,pos) is the boundary between the 0-group and 1-group
-    --   within the sorted node window.
-    --
-    -- Synthesis note: the generate loop instantiates one process per (l,pos)
-    -- pair.  Every signal write uses the generate-time constants l and pos as
-    -- indices, so all assignments elaborate to FIXED addresses — no variable-
-    -- indexed writes and no mux explosion.
-    -- Combinational: split_level always tracks the current numout_level(l,1)
-    -- so ff_dp_partition reads consistent data at the same clock edge.
+    -- ff_cd_count: direct per-node zero/one counting.
+    -- After fs_scatter, entries from the same node are NOT contiguous (split
+    -- between zero and one pools), so we cannot use boundary-based scanning.
+    -- Instead, scan all entries, extract each entry's node ID and sort bit,
+    -- and accumulate per-node counts directly.
+    -- ff_cd_shards: one-sided split finder (original, boundary-based).
+    -- Used by histogram (hist_update reads node_zeros/node_ones).
     ff_cd_shards:
     for l in 0 to N_LEVELS-2 generate
-        shards_pos: for pos in 0 to LEVEL_SIZE-2 generate
+        shards_pos: for pos in 0 to LEVEL_SIZE-1 generate
             process(numout_level, sorted_start_level, sorted_end_level)
                 constant KEY_BIT : integer := KEY_OFFSET + (l mod (PRECISIONS - KEY_OFFSET));
                 variable n_z : integer range 0 to LEVEL_SIZE;
+                variable v_start : integer range 0 to LEVEL_SIZE;
+                variable v_end   : integer range 0 to LEVEL_SIZE;
+                variable found : boolean;
             begin
+                v_start := sorted_start_level(l, pos);
+                v_end   := sorted_end_level(l, pos);
                 n_z := 0;
-                for i in 0 to LEVEL_SIZE-1 loop
-                    if i >= sorted_start_level(l, pos) and
-                       i <  sorted_end_level(l, pos) and
-                       numout_level(l, 1)(i*PRECISIONS + KEY_BIT) = '0' then
-                        n_z := n_z + 1;
+                found := false;
+                if v_end > v_start then
+                    for i in 0 to LEVEL_SIZE-1 loop
+                        if not found and i >= v_start and i < v_end then
+                            if numout_level(l, 1)(i*PRECISIONS + KEY_BIT) = '1' then
+                                found := true;
+                                n_z := i - v_start;
+                            end if;
+                        end if;
+                    end loop;
+                    if not found then
+                        n_z := v_end - v_start;
                     end if;
-                end loop;
+                end if;
                 node_zeros(l, pos)  <= n_z;
-                node_ones(l, pos)   <= sorted_end_level(l, pos)
-                                    - sorted_start_level(l, pos) - n_z;
-                split_level(l, pos) <= sorted_start_level(l, pos) + n_z;
+                node_ones(l, pos)   <= v_end - v_start - n_z;
+                split_level(l, pos) <= v_start + n_z;
             end process;
         end generate shards_pos;
     end generate ff_cd_shards;
     
-    -- mem_update: clocked process that writes per-node sorted statistics to
-    -- external RAM via the req signals, one N_BKTS-slot group per node pos.
-    --   slot pos*N_BKTS+0 : write  node_zeros & node_ones  (zeros/ones count pair)
-    --   slot pos*N_BKTS+1 : read-back the same address for host accumulation
-    -- split_level and sorted_end are NOT stored separately: they are fully
-    -- derivable as sorted_start + node_zeros and sorted_start + node_zeros + node_ones.
-    -- The 0-child address pointer is written only on first-time node creation
-    -- (n_address = 0, p >= P_COMPUTABLE) — not yet implemented; requires
-    -- n_address tracking to be added.
-    -- Addressing uses get_addr(node_id, N) for tree-hierarchy RAM layout.
-    mem_update:
-    for pos in 0 to LEVEL_SIZE-2 generate
-        process(clk)
-        begin
-            if rising_edge(clk) then
-                -- Slot 0: write zeros + ones counts
-                req_addr(pos * N_BKTS + 0) <= std_logic_vector(
-                    to_unsigned(get_addr(pos, N)(0), 32));
-                req_data(pos * N_BKTS + 0) <=
-                    std_logic_vector(to_unsigned(node_zeros(N_LEVELS-2, pos), W_ADDR)) &
-                    std_logic_vector(to_unsigned(node_ones (N_LEVELS-2, pos), W_ADDR));
-                req_wr_en(pos * N_BKTS + 0) <= '1';
-                req_re_en(pos * N_BKTS + 0) <= '0';
-
-                -- Slot 1: read-back same address for host to accumulate across batches
-                req_addr(pos * N_BKTS + 1) <= std_logic_vector(
-                    to_unsigned(get_addr(pos, N)(0), 32));
-                req_data(pos * N_BKTS + 1) <= (others => '0');
-                req_wr_en(pos * N_BKTS + 1) <= '0';
-                req_re_en(pos * N_BKTS + 1) <= '1';
+    -- Histogram URAM: single-port read/write
+    hist_sram: process(clk)
+    begin
+        if rising_edge(clk) then
+            if hist_wr_en = '1' then
+                hist_mem(hist_wr_addr) <= hist_wr_data;
             end if;
-        end process;
-    end generate mem_update;
+            hist_rd_data <= hist_mem(hist_rd_addr);
+        end if;
+    end process;
 
-    -- ff_dp_partition: for each level l, reorder entries within each node
-    -- so that d_p=0 entries fill [sorted_start, split) and d_p=1 entries fill
-    -- [split, sorted_end), writing the result to numout_level(l+1, 0) which
-    -- becomes the input for the next pipeline stage.
+    -- Combinational: extract bin_id and trailing bits from each sorted pipeline entry
+    scatter_extract: process(numout_level)
+        variable key : std_logic_vector(KEY_WIDTH-1 downto 0);
+    begin
+        for i in 0 to LEVEL_SIZE-1 loop
+            key := numout_level(N_LEVELS-1, 1)(
+                i*PRECISIONS + KEY_OFFSET + KEY_WIDTH - 1
+                downto
+                i*PRECISIONS + KEY_OFFSET);
+            scatter_bin_ids(i) <= to_integer(unsigned(
+                key(KEY_WIDTH-1 downto KEY_WIDTH-BIN_ID_BITS)));
+            scatter_entries(i) <= key(BIN_ENTRY_WIDTH-1 downto 0);
+            if unsigned(key) /= 0 then
+                scatter_valid(i) <= '1';
+            else
+                scatter_valid(i) <= '0';
+            end if;
+        end loop;
+    end process;
+
+    -- Throttle: assert when SRAM occupancy is high
+    throttle_active <= '1' when sram_total_entries > SRAM_THROTTLE_ENTRIES else '0';
+
+    -- HBM output mux: Phase 1 drain vs Phase 2 write-back
+    hbm_wr_en   <= p2_hbm_wr_en   when phase = PHASE2_SORT else p1_hbm_wr_en;
+    hbm_dout    <= p2_hbm_dout    when phase = PHASE2_SORT else p1_hbm_dout;
+    hbm_wr_addr <= p2_hbm_wr_addr when phase = PHASE2_SORT else p1_hbm_wr_addr;
+    sort_complete <= p2_finished;
+
+    -- hist_bin_update: state machine that iterates over nodes, updates histogram
+    -- counters via read-modify-write in local SRAM, and writes bin entries for
+    -- last-level nodes.
     --
-    -- Outer generate over l: one process per level, so numout_level(l+1,0)
-    -- has exactly one driver per level — no multi-driver conflict.
-    -- Inner j loop (0..LEVEL_SIZE-1) is unrolled to compile-time constants,
-    -- so every slice write has a fixed address — no mux explosion.
-    --
-    -- numout_level(0,0) is driven by fs_scatter (= numbers_p).
-    -- ff_dp_partition writes numout_level(l+1,0) after fs_scatter sorts each level.
-    -- ff_dp_partition: reorder entries within each node so d_p=0 entries fill
-    -- [sorted_start, split) and d_p=1 entries fill [split, sorted_end), writing
-    -- the result to numout_level(l+1, 0) for the next pipeline stage.
-    --
-    -- Generate over both l and j: 41*8=328 instances, each owning one output
-    -- slice — exactly one driver per (l+1, 0, j) with no multi-driver conflict.
-    --
-    -- Each process has two SEQUENTIAL (not nested) for loops:
-    --   1. pos loop (7 iters): find this j's node bounds → local variables
-    --   2. i   loop (8 iters): find the rank-th same-type entry in the node
-    -- Total: 7+8=15 iterations vs the naive 7*8=56 nested approach.
+    -- For each pos (0..LEVEL_SIZE-2):
+    --   Inner loop: l from log2ceil(pos+1) to min(N_LEVELS-NODE_LEVELS+1+pos, N_LEVELS-2)
+    --     At first l where node_zeros(l,pos)>0 AND node_ones(l,pos)>0:
+    --       histogram path = first l key bits of entry at pos
+    --       histogram addr = 2^l - 1 + path_value
+    --       accumulate node_ones(l,pos) with counter width W_ADDR-floor(lh/2)
+    --       break
+    --   If log2ceil(pos+1) >= NODE_LEVELS-1: write to channel bin
+    -- hist_update: state machine that iterates over nodes, updates histogram
+    -- counters via read-modify-write in URAM. Bin writes are now handled by
+    -- scatter_write (Phase 1), so this FSM only does histogram accumulation.
+    hist_update: process(clk)
+        type state_t is (IDLE, SCAN_L, HIST_READ, HIST_WRITE, NEXT_POS);
+        variable state      : state_t := IDLE;
+        variable curr_pos   : integer range 0 to LEVEL_SIZE-1 := 0;
+        variable curr_l     : integer range 0 to N_LEVELS-1 := 0;
+        variable l_end      : integer range 0 to N_LEVELS-1 := 0;
+        variable v_hist_addr : integer range 0 to HIST_DEPTH-1 := 0;
+        variable v_hist_lh  : integer range 0 to LC := 0;
+        variable path_val   : integer := 0;
+        variable ctr_width  : integer range 1 to W_ADDR := W_ADDR;
+        variable ones_val   : integer := 0;
+        variable new_val    : unsigned(W_ADDR-1 downto 0) := (others => '0');
+        variable mask       : unsigned(W_ADDR-1 downto 0) := (others => '1');
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                state := IDLE;
+                hist_wr_en <= '0';
+            else
+                hist_wr_en <= '0';
+
+                case state is
+                    when IDLE =>
+                        curr_pos := 0;
+                        curr_l := 0;
+                        l_end := min(min(N_LEVELS - NODE_LEVELS + 1, N_LEVELS - 2), LC);
+                        state := SCAN_L;
+
+                    when SCAN_L =>
+                        if curr_l <= l_end then
+                            if node_zeros(curr_l, curr_pos) > 0 and
+                               node_ones(curr_l, curr_pos) > 0 then
+                                v_hist_lh := curr_l;
+                                if curr_l = 0 then
+                                    path_val := 0;
+                                else
+                                    path_val := to_integer(unsigned(
+                                        numout_level(curr_l, 1)(
+                                            curr_pos*PRECISIONS + KEY_OFFSET + curr_l - 1
+                                            downto
+                                            curr_pos*PRECISIONS + KEY_OFFSET)));
+                                end if;
+                                if v_hist_lh <= LC then
+                                    v_hist_addr := 2**v_hist_lh - 1 + path_val;
+                                    ones_val := node_ones(curr_l, curr_pos);
+                                    hist_rd_addr <= v_hist_addr;
+                                    state := HIST_READ;
+                                else
+                                    state := NEXT_POS;
+                                end if;
+                            else
+                                curr_l := curr_l + 1;
+                            end if;
+                        else
+                            state := NEXT_POS;
+                        end if;
+
+                    when HIST_READ =>
+                        state := HIST_WRITE;
+
+                    when HIST_WRITE =>
+                        ctr_width := W_ADDR - v_hist_lh / 2;
+                        mask := (others => '0');
+                        for b in 0 to W_ADDR-1 loop
+                            if b < ctr_width then
+                                mask(b) := '1';
+                            end if;
+                        end loop;
+                        new_val := (unsigned(hist_rd_data) + to_unsigned(ones_val, W_ADDR)) and mask;
+                        hist_wr_addr <= v_hist_addr;
+                        hist_wr_data <= std_logic_vector(new_val);
+                        hist_wr_en <= '1';
+                        state := NEXT_POS;
+
+                    when NEXT_POS =>
+                        if curr_pos >= LEVEL_SIZE - 2 then
+                            state := IDLE;
+                        else
+                            curr_pos := curr_pos + 1;
+                            curr_l := log2ceil(curr_pos + 1);
+                            l_end := min(min(N_LEVELS - NODE_LEVELS + 1 + curr_pos, N_LEVELS - 2), LC);
+                            state := SCAN_L;
+                        end if;
+                end case;
+            end if;
+        end if;
+    end process;
+
+    -- ff_dp_partition: arithmetic destination computation.
+    -- After fs_scatter, zeros are at [0..total_zeros-1], ones at [total_zeros..LEVEL_SIZE-1].
+    -- Relative order preserved → node's zeros/ones are contiguous sub-ranges.
+    -- zeros_before(l,nid) = cumulative zeros from nodes 0..nid-1.
+    -- Source for output j in node nid:
+    --   zero-slot: src = zeros_before(nid) + (j - node_start)
+    --   one-slot:  src = total_zeros + ones_before(nid) + (j - split)
+
+    -- Prefix-sum of zeros/ones across nodes (combinational)
+    -- Used by histogram only; ff_dp_partition computes its own counts inline.
+    ff_dp_prefix: process(node_zeros, node_ones)
+        variable z_acc, o_acc : integer range 0 to LEVEL_SIZE;
+    begin
+        for l in 0 to N_LEVELS-2 loop
+            z_acc := 0;
+            o_acc := 0;
+            for nid in 0 to LEVEL_SIZE-1 loop
+                zeros_before(l, nid) <= z_acc;
+                ones_before(l, nid)  <= o_acc;
+                z_acc := z_acc + node_zeros(l, nid);
+                o_acc := o_acc + node_ones(l, nid);
+            end loop;
+        end loop;
+    end process;
+
+    -- ff_dp_partition: pass-through register stage.
+    -- LSD radix sort: each level sorts by one key bit from LSB to MSB.
+    -- No per-node regrouping needed — just register the scatter output
+    -- to the next level's input.
     ff_dp_partition:
     for l in 0 to N_LEVELS-2 generate
         part_j: for j in 0 to LEVEL_SIZE-1 generate
             process(clk)
-                constant KEY_BIT : integer := KEY_OFFSET + (l mod (PRECISIONS - KEY_OFFSET));
-                variable v_start : integer range 0 to LEVEL_SIZE;
-                variable v_split : integer range 0 to LEVEL_SIZE;
-                variable v_end   : integer range 0 to LEVEL_SIZE;
-                variable rank    : integer range 0 to LEVEL_SIZE;
-                variable cnt     : integer range 0 to LEVEL_SIZE;
-                variable entry_i : std_logic_vector(PRECISIONS-1 downto 0);
             begin
                 if rising_edge(clk) then
-                    -- Pass 1: find the node that owns output position j
-                    v_start := 0; v_split := 0; v_end := 0;
-                    for pos in 0 to LEVEL_SIZE-1 loop
-                        if j >= sorted_start_level(l, pos) and
-                           j <  sorted_end_level(l, pos) then
-                            v_start := sorted_start_level(l, pos);
-                            v_split := split_level(l, pos);
-                            v_end   := sorted_end_level(l, pos);
-                        end if;
-                    end loop;
-                    -- Rank of j within its type group (0s first)
-                    if j < v_split then
-                        rank := j - v_start;   -- 0-slot
-                    else
-                        rank := j - v_split;   -- 1-slot
-                    end if;
-                    -- Pass 2: find the rank-th same-type entry within the node
-                    -- Key bit read directly from entry; no d_p port needed
-                    entry_i := (others => '0');
-                    cnt := 0;
-                    for i in 0 to LEVEL_SIZE-1 loop
-                        if i >= v_start and i < v_end then
-                            if (j < v_split and numout_level(l, 1)(i*PRECISIONS + KEY_BIT) = '0') or
-                               (j >= v_split and numout_level(l, 1)(i*PRECISIONS + KEY_BIT) = '1') then
-                                if cnt = rank then
-                                    entry_i := numout_level(l, 1)
-                                        ((i+1)*PRECISIONS-1 downto i*PRECISIONS);
-                                end if;
-                                cnt := cnt + 1;
-                            end if;
-                        end if;
-                    end loop;
-                    -- Record which group this output slot belongs to (0=zeros, 1=ones).
-                    -- Bit l of entry encodes the node ID bit for level l (for l < LOGN).
-                    if l < LOGN then
-                        if j < v_split then
-                            entry_i(l) := '0';
-                        else
-                            entry_i(l) := '1';
-                        end if;
-                    end if;
-                    numout_level(l+1, 0)((j+1)*PRECISIONS-1 downto j*PRECISIONS) <= entry_i;
+                    numout_level(l+1, 0)((j+1)*PRECISIONS-1 downto j*PRECISIONS)
+                        <= numout_level(l, 1)((j+1)*PRECISIONS-1 downto j*PRECISIONS);
                 end if;
             end process;
         end generate part_j;
@@ -807,13 +1023,15 @@ architecture Behavioral of counter is
         end process;
     end generate fs_count;
 
-    -- fs_scatter: clocked, one process per (l,j).
-    -- Uses shared fs_total_ones(l) (2 scan loops, no count loop duplication).
-    -- 0-entries mapped to positions 0..total_zeros-1,
-    -- 1-entries mapped to positions total_zeros..LEVEL_SIZE-1.
+    -- fs_scatter: single-pass radix sort stage.
+    -- Only one scan needed: zeros count is the inverse of ones count.
+    -- Pass 1 finds the j-th zero-entry; Pass 2 (overwrite) finds the
+    -- (j-total_zeros)-th one-entry.  Only one pass produces a valid result
+    -- for any given j, so the other's assignment is harmless.
 
-    -- Stage-0 input: register raw numbers input
-    numout_level(0, 0) <= numbers_p;
+    -- Stage-0 input: mux between raw pipeline input (Phase 1) and readback buffer (Phase 2)
+    pipeline_input <= p2_batch_buf when phase = PHASE2_SORT else numbers_p;
+    numout_level(0, 0) <= pipeline_input;
 
     fs_scatter:
     for l in 0 to N_LEVELS-1 generate
@@ -854,37 +1072,269 @@ architecture Behavioral of counter is
     end generate fs_scatter;
 
 
-    mem_req_arbiter: process(clk)
-        -- Round-robin over all N_BKTS*LEVEL_SIZE-1 request slots.
-        -- Sends one request per cycle unconditionally (fire-and-forget for writes;
-        -- reads are also pipelined). The outer arbiter in fractal.vhd rate-limits
-        -- forwarding via fifo_ready, but we don't block here — that way the
-        -- inner req_turn advances every cycle and cycles through all node slots.
-        constant N_SLOTS : integer := N_BKTS * LEVEL_SIZE - 1;
-        variable next_s  : integer range 0 to N_BKTS*LEVEL_SIZE-2;
-        variable found   : boolean;
+    -- Old FIFO interface now unused (histogram is local SRAM, bins drain via HBM/DRAM/SSD)
+    fifo_wr_en <= '0';
+    fifo_re_en <= '0';
+    fifo_dw    <= (others => '0');
+
+    -- DRAM/SSD interfaces inactive for now (only HBM bins implemented)
+    dram_wr_en <= '0';
+    dram_dout  <= (others => '0');
+    ssd_wr_en  <= '0';
+    ssd_dout   <= (others => '0');
+
+    -- bin_controller: unified process handling both scatter writes (from pipeline)
+    -- and HBM drain (to off-chip memory). Single driver for all bin state.
+    --
+    -- Scatter: 1 entry written per cc (serialized from LEVEL_SIZE pipeline outputs)
+    -- Drain: stride-N_HBM_CHAN round-robin, 1 entry read per cc, full-payload gated
+    bin_controller: process(clk)
+        variable wr_bid : integer range 0 to N_BINS-1;
+        variable wr_addr : integer range 0 to BIN_SRAM_DEPTH-1;
+        variable drain_bin : integer range 0 to N_BINS-1;
+        variable has_payload : boolean;
+        variable did_write : boolean;
+        variable did_read : boolean;
     begin
         if rising_edge(clk) then
-            fifo_wr_en <= '0';
-            fifo_re_en <= '0';
-            fifo_dw    <= (others => '0');
-            found := false;
-            for i in 0 to N_BKTS*LEVEL_SIZE-2 loop
-                next_s := (req_turn + i) mod N_SLOTS;
-                if not found then
-                    if req_wr_en(next_s) = '1' then
-                        fifo_wr_en <= '1';
-                        fifo_dw    <= req_addr(next_s) & req_data(next_s);
-                        req_turn   <= (next_s + 1) mod N_SLOTS;
-                        found      := true;
-                    elsif req_re_en(next_s) = '1' then
-                        fifo_re_en <= '1';
-                        fifo_dw    <= req_addr(next_s) & req_data(next_s);
-                        req_turn   <= (next_s + 1) mod N_SLOTS;
-                        found      := true;
+            p1_hbm_wr_en <= '0';
+            if reset = '1' then
+                scatter_wr_idx <= 0;
+                scatter_pending <= '0';
+                drain_base <= 0;
+                drain_sub <= 0;
+                sram_total_entries <= 0;
+                phase <= PHASE1_SCATTER;
+                for b in 0 to N_BINS-1 loop
+                    bin_wr_ptr(b) <= 0;
+                    bin_rd_ptr(b) <= 0;
+                    bin_count(b) <= 0;
+                    hbm_bin_wr_count(b) <= 0;
+                end loop;
+            else
+                did_write := false;
+                did_read := false;
+
+                -- === PHASE TRANSITIONS ===
+                if phase = PHASE1_SCATTER and phase1_complete = '1' then
+                    phase <= PHASE1_FLUSH;
+                end if;
+                if phase = PHASE1_FLUSH and sram_total_entries = 0 then
+                    phase <= PHASE2_SORT;
+                end if;
+                if phase = PHASE2_SORT and p2_finished = '1' then
+                    phase <= PHASE_DONE;
+                end if;
+
+                -- === SCATTER WRITE (Phase 1) ===
+                if phase = PHASE1_SCATTER and
+                   scatter_valid(scatter_wr_idx) = '1' then
+                    wr_bid := scatter_bin_ids(scatter_wr_idx);
+                    if bin_count(wr_bid) < BIN_BUF_DEPTH then
+                        wr_addr := wr_bid * BIN_BUF_DEPTH + bin_wr_ptr(wr_bid);
+                        bin_sram(wr_addr) <= scatter_entries(scatter_wr_idx);
+                        if bin_wr_ptr(wr_bid) = BIN_BUF_DEPTH - 1 then
+                            bin_wr_ptr(wr_bid) <= 0;
+                        else
+                            bin_wr_ptr(wr_bid) <= bin_wr_ptr(wr_bid) + 1;
+                        end if;
+                        bin_count(wr_bid) <= bin_count(wr_bid) + 1;
+                        did_write := true;
                     end if;
                 end if;
-            end loop;
+
+                -- Advance scatter write index
+                if phase = PHASE1_SCATTER then
+                    if scatter_wr_idx = LEVEL_SIZE - 1 then
+                        scatter_wr_idx <= 0;
+                    else
+                        scatter_wr_idx <= scatter_wr_idx + 1;
+                    end if;
+                end if;
+
+                -- === HBM DRAIN (Phase 1 scatter + flush) ===
+                if phase = PHASE1_SCATTER or phase = PHASE1_FLUSH then
+                    drain_bin := (drain_base + drain_sub) mod N_BINS;
+
+                    has_payload := (bin_count(drain_bin) >= HBM_ENTRIES_PER_PAYLOAD);
+                    if phase = PHASE1_FLUSH then
+                        has_payload := (bin_count(drain_bin) > 0);
+                    end if;
+
+                    if hbm_ready = '1' and has_payload then
+                        p1_hbm_dout <= bin_sram(drain_bin * BIN_BUF_DEPTH + bin_rd_ptr(drain_bin));
+                        p1_hbm_wr_en <= '1';
+                        p1_hbm_wr_addr <= std_logic_vector(to_unsigned(
+                            drain_bin * MAX_BIN_ENTRIES + hbm_bin_wr_count(drain_bin), 32));
+                        hbm_bin_wr_count(drain_bin) <= hbm_bin_wr_count(drain_bin) + 1;
+                        if bin_rd_ptr(drain_bin) = BIN_BUF_DEPTH - 1 then
+                            bin_rd_ptr(drain_bin) <= 0;
+                        else
+                            bin_rd_ptr(drain_bin) <= bin_rd_ptr(drain_bin) + 1;
+                        end if;
+                        if did_write and wr_bid = drain_bin then
+                            bin_count(drain_bin) <= bin_count(drain_bin);
+                        else
+                            bin_count(drain_bin) <= bin_count(drain_bin) - 1;
+                        end if;
+                        did_read := true;
+                    end if;
+
+                    -- Advance drain stride
+                    if drain_sub = N_HBM_CHAN - 1 then
+                        drain_sub <= 0;
+                        if drain_base + N_HBM_CHAN >= N_BINS then
+                            drain_base <= 0;
+                        else
+                            drain_base <= drain_base + N_HBM_CHAN;
+                        end if;
+                    else
+                        drain_sub <= drain_sub + 1;
+                    end if;
+                end if;
+
+                -- Update total SRAM occupancy
+                if did_write and not did_read then
+                    sram_total_entries <= sram_total_entries + 1;
+                elsif did_read and not did_write then
+                    sram_total_entries <= sram_total_entries - 1;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- Phase 2 controller: read bins from HBM, sort through pipeline, write back
+    phase2_ctrl: process(clk)
+        variable v_entry : std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+    begin
+        if rising_edge(clk) then
+            p2_hbm_wr_en <= '0';
+            hbm_rd_req <= '0';
+            if reset = '1' then
+                p2_state <= P2_IDLE;
+                p2_finished <= '0';
+                p2_curr_bin <= 0;
+                p2_read_idx <= 0;
+                p2_batch_fill <= 0;
+                p2_batch_buf <= (others => '0');
+                p2_sort_count <= 0;
+                p2_write_idx <= 0;
+                p2_batch_valid <= 0;
+                p2_bin_write_count <= 0;
+            else
+                case p2_state is
+                    when P2_IDLE =>
+                        if phase = PHASE2_SORT then
+                            p2_curr_bin <= 0;
+                            p2_read_idx <= 0;
+                            p2_batch_fill <= 0;
+                            p2_bin_write_count <= 0;
+                            p2_batch_buf <= (others => '0');
+                            if hbm_bin_wr_count(0) > 0 then
+                                p2_state <= P2_REQ_READ;
+                            else
+                                p2_state <= P2_NEXT_BIN;
+                            end if;
+                        end if;
+
+                    when P2_REQ_READ =>
+                        -- Request one entry from HBM
+                        hbm_rd_req <= '1';
+                        hbm_rd_addr <= std_logic_vector(to_unsigned(
+                            p2_curr_bin * MAX_BIN_ENTRIES + p2_read_idx, 32));
+                        p2_state <= P2_WAIT_READ;
+
+                    when P2_WAIT_READ =>
+                        -- Wait for valid read data from HBM
+                        if hbm_rd_valid = '1' then
+                            -- Pack into batch buffer: zero-pad metadata, place key bits
+                            p2_batch_buf(
+                                p2_batch_fill*PRECISIONS + KEY_OFFSET + BIN_ENTRY_WIDTH - 1
+                                downto
+                                p2_batch_fill*PRECISIONS + KEY_OFFSET
+                            ) <= hbm_rd_data;
+                            -- Zero the metadata bits (already zero from init, but be explicit)
+                            p2_batch_buf(
+                                p2_batch_fill*PRECISIONS + KEY_OFFSET - 1
+                                downto
+                                p2_batch_fill*PRECISIONS
+                            ) <= (others => '0');
+
+                            p2_read_idx <= p2_read_idx + 1;
+
+                            if p2_batch_fill = LEVEL_SIZE - 1 or
+                               p2_read_idx = hbm_bin_wr_count(p2_curr_bin) - 1 then
+                                -- Batch full or no more entries in this bin
+                                p2_batch_valid <= p2_batch_fill + 1;
+                                p2_sort_count <= 0;
+                                p2_state <= P2_SORT_WAIT;
+                            else
+                                p2_batch_fill <= p2_batch_fill + 1;
+                                p2_state <= P2_REQ_READ;
+                            end if;
+                        end if;
+
+                    when P2_SORT_WAIT =>
+                        -- Wait for pipeline to process the batch
+                        if p2_sort_count >= PIPELINE_LATENCY + 2 then
+                            p2_write_idx <= 0;
+                            p2_state <= P2_WRITE_OUT;
+                        else
+                            p2_sort_count <= p2_sort_count + 1;
+                        end if;
+
+                    when P2_WRITE_OUT =>
+                        -- Write sorted entries to HBM (skip zero-padded slots)
+                        -- Valid entries sort last (zeros sort first), so write from
+                        -- position (LEVEL_SIZE - p2_batch_valid) onwards
+                        if p2_write_idx < p2_batch_valid then
+                            v_entry := numout_level(N_LEVELS-1, 1)(
+                                (LEVEL_SIZE - p2_batch_valid + p2_write_idx)*PRECISIONS + KEY_OFFSET + BIN_ENTRY_WIDTH - 1
+                                downto
+                                (LEVEL_SIZE - p2_batch_valid + p2_write_idx)*PRECISIONS + KEY_OFFSET);
+                            p2_hbm_wr_en <= '1';
+                            p2_hbm_dout <= v_entry;
+                            -- Write to sorted output area (offset past scatter area)
+                            p2_hbm_wr_addr <= std_logic_vector(to_unsigned(
+                                N_BINS * MAX_BIN_ENTRIES +
+                                p2_curr_bin * MAX_BIN_ENTRIES +
+                                p2_bin_write_count, 32));
+                            p2_bin_write_count <= p2_bin_write_count + 1;
+                            p2_write_idx <= p2_write_idx + 1;
+                        else
+                            p2_state <= P2_NEXT_BATCH;
+                        end if;
+
+                    when P2_NEXT_BATCH =>
+                        p2_batch_fill <= 0;
+                        p2_batch_buf <= (others => '0');
+                        if p2_read_idx >= hbm_bin_wr_count(p2_curr_bin) then
+                            p2_state <= P2_NEXT_BIN;
+                        else
+                            p2_state <= P2_REQ_READ;
+                        end if;
+
+                    when P2_NEXT_BIN =>
+                        if p2_curr_bin = N_BINS - 1 then
+                            p2_state <= P2_DONE;
+                        else
+                            p2_curr_bin <= p2_curr_bin + 1;
+                            p2_read_idx <= 0;
+                            p2_batch_fill <= 0;
+                            p2_bin_write_count <= 0;
+                            p2_batch_buf <= (others => '0');
+                            if hbm_bin_wr_count(p2_curr_bin + 1) > 0 then
+                                p2_state <= P2_REQ_READ;
+                            else
+                                p2_state <= P2_NEXT_BIN;
+                            end if;
+                        end if;
+
+                    when P2_DONE =>
+                        p2_finished <= '1';
+
+                end case;
+            end if;
         end if;
     end process;
 

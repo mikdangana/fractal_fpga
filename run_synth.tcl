@@ -8,7 +8,7 @@ read_vhdl -library work [list \
 
 synth_design \
     -top fractal \
-    -part xcvu47p-fsvh2892-2-e \
+    -part xcku3p-ffva676-2-e \
     -mode out_of_context \
     -flatten_hierarchy rebuilt \
     -directive RuntimeOptimized
