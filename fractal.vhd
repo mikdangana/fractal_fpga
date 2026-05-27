@@ -67,26 +67,37 @@ entity fractal is
 	          fifo_ready: in std_logic;
 	          -- HBM controller interface
 	          hbm_wr_en : out std_logic;
-	          hbm_dout  : out std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+	          hbm_dout  : out std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
 	          hbm_ready : in std_logic;
 	          -- DRAM controller interface
 	          dram_wr_en : out std_logic;
-	          dram_dout  : out std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+	          dram_dout  : out std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
 	          dram_ready : in std_logic;
 	          -- SSD controller interface
 	          ssd_wr_en : out std_logic;
-	          ssd_dout  : out std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+	          ssd_dout  : out std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
 	          ssd_ready : in std_logic;
 	          -- Phase control
 	          phase1_complete : in std_logic;
 	          sort_complete : out std_logic;
-	          -- HBM write address
+	          -- HBM write/read interface
 	          hbm_wr_addr : out std_logic_vector(31 downto 0);
-	          -- HBM read interface (Phase 2)
 	          hbm_rd_req  : out std_logic;
 	          hbm_rd_addr : out std_logic_vector(31 downto 0);
-	          hbm_rd_data : in std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
-	          hbm_rd_valid : in std_logic );
+	          hbm_rd_data : in std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
+	          hbm_rd_valid : in std_logic;
+	          -- DRAM write/read interface
+	          dram_wr_addr : out std_logic_vector(31 downto 0);
+	          dram_rd_req  : out std_logic;
+	          dram_rd_addr : out std_logic_vector(31 downto 0);
+	          dram_rd_data : in std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
+	          dram_rd_valid : in std_logic;
+	          -- SSD write/read interface
+	          ssd_wr_addr : out std_logic_vector(31 downto 0);
+	          ssd_rd_req  : out std_logic;
+	          ssd_rd_addr : out std_logic_vector(31 downto 0);
+	          ssd_rd_data : in std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
+	          ssd_rd_valid : in std_logic );
 end fractal;
 
 architecture Behavioral of fractal is
@@ -164,7 +175,7 @@ architecture Behavioral of fractal is
 				  
 	type level_inp is array(FULL_PRECISION-1 downto 0) of std_logic_vector(LEVEL_SIZE-1 downto 0);
 	type level_bits is array(31 downto 0) of std_logic_vector(LEVEL_SIZE-1 downto 0);
-	type level_nums is array(N_FF_LEVELS downto 0) of std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0);
+	type level_nums is array(N_FF_LEVELS downto 0) of std_logic_vector(LEVEL_SIZE*RAW_PRECISION-1 downto 0);
 	type n_LEVEL_SIZE is array(N-1 downto 0) of std_logic_vector(LEVEL_SIZE-1 downto 0);
 	type level_fbits is array(19 downto 0) of std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0);
 	type level_fbits_array is array(N-1 downto 0) of std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0);
@@ -210,7 +221,7 @@ architecture Behavioral of fractal is
 	signal zero : std_logic_vector(PRECISIONS-1 downto 0) := (PRECISIONS-1 downto 0 => '0');
 	signal zero_LEVEL_SIZE : std_logic_vector(LEVEL_SIZE-1 downto 0) := (LEVEL_SIZE-1 downto 0 => '0');
 	signal in_numbers : std_logic_vector(LEVEL_SIZE*PRECISIONS-1 downto 0) := (LEVEL_SIZE*PRECISIONS-1 downto 0 => '0');
-	signal level_p : level_nums := (N_FF_LEVELS downto 0 => (INPUT_SIZE*PRECISIONS-1 downto 0 => '0'));
+	signal level_p : level_nums := (N_FF_LEVELS downto 0 => (INPUT_SIZE*RAW_PRECISION-1 downto 0 => '0'));
 			  
 	signal ZERO_STARTS: level_ptrs := 
 	   (N_FF_LEVELS downto 0 => (LEVEL_SIZE*log2ceil(LEVEL_SIZE)-1 downto 0 => '0'));
@@ -228,27 +239,43 @@ architecture Behavioral of fractal is
     signal fifo_q : count_1d_t(0 to N_BKTS*LEVEL_SIZE) := (others => 0);
 	signal child_counts : count_1d_t(1 to N_FF_LEVELS-N_BASE_LEVELS) := (others => 0);
 
-    -- HBM/DRAM/SSD interface signals per counter instance
-    type slv_bin_arr is array (natural range <>) of std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
-    signal hbm_wr_ens  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-    signal hbm_douts   : slv_bin_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
-    signal hbm_readys  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-    signal dram_wr_ens : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-    signal dram_douts  : slv_bin_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
-    signal dram_readys : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-    signal ssd_wr_ens  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-    signal ssd_douts   : slv_bin_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
-    signal ssd_readys  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-
-    -- Phase 2 per-instance signals
+    -- Memory interface signals per counter instance (all tiers use same payload width)
+    type slv_payload_arr is array (natural range <>) of std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
     type slv32_arr is array (natural range <>) of std_logic_vector(31 downto 0);
+
+    -- HBM per-instance
+    signal hbm_wr_ens  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal hbm_douts   : slv_payload_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal hbm_readys  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal hbm_wr_addrs : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal hbm_rd_reqs  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal hbm_rd_addrs : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal hbm_rd_datas : slv_payload_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal hbm_rd_valids : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+
+    -- DRAM per-instance
+    signal dram_wr_ens  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal dram_douts   : slv_payload_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal dram_readys  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal dram_wr_addrs : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal dram_rd_reqs  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal dram_rd_addrs : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal dram_rd_datas : slv_payload_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal dram_rd_valids : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+
+    -- SSD per-instance
+    signal ssd_wr_ens  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal ssd_douts   : slv_payload_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal ssd_readys  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal ssd_wr_addrs : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal ssd_rd_reqs  : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+    signal ssd_rd_addrs : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal ssd_rd_datas : slv_payload_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
+    signal ssd_rd_valids : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
+
+    -- Phase control per-instance
     signal phase1_completes : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
     signal sort_completes   : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-    signal hbm_wr_addrs     : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
-    signal hbm_rd_reqs      : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
-    signal hbm_rd_addrs     : slv32_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
-    signal hbm_rd_datas     : slv_bin_arr(N_FF_LEVELS downto 0) := (others => (others => '0'));
-    signal hbm_rd_valids    : std_logic_vector(N_FF_LEVELS downto 0) := (others => '0');
 	
 	--impure function equal(a : std_logic_vector; b : std_logic_vector) return std_logic is
 	  --  variable av : std_logic_vector(a'length-1 downto 0) := a;
@@ -277,15 +304,11 @@ architecture Behavioral of fractal is
 		
 			Levels:
 			for l in 1 to N_FF_LEVELS-N_BASE_LEVELS generate
-			    input_row: for lc in 0 to (RAW_PRECISION/N_FF_LEVELS)-1 generate
-			         input_entry: for j in 0 to INPUT_SIZE-1 generate
-			             -- Dest: key bit lc of entry j in level_p (bits KEY_OFFSET..KEY_OFFSET+41)
-			             -- Src:  bit lc of raw entry j in the time-delayed snapshot
-			             level_p(l)(j*PRECISIONS + (2*LOGN+1) + lc) <=
-			                 raw_numbers((l-1)*(RAW_PRECISION/N_FF_LEVELS)+lc)
-			                     (j*RAW_PRECISION + lc);
-			         end generate input_entry;
-			    end generate input_row;
+			    -- Pass full RAW_PRECISION data directly to counter
+			    input_entry: for j in 0 to INPUT_SIZE-1 generate
+			        level_p(l)((j+1)*RAW_PRECISION-1 downto j*RAW_PRECISION)
+			            <= raw_numbers_in((j+1)*RAW_PRECISION-1 downto j*RAW_PRECISION);
+			    end generate input_entry;
 				
 				Level:
 				for p in 0 to 0 generate --2**l-1 generate
@@ -336,7 +359,17 @@ architecture Behavioral of fractal is
 								  hbm_rd_req => hbm_rd_reqs(l),
 								  hbm_rd_addr => hbm_rd_addrs(l),
 								  hbm_rd_data => hbm_rd_datas(l),
-								  hbm_rd_valid => hbm_rd_valids(l));
+								  hbm_rd_valid => hbm_rd_valids(l),
+								  dram_wr_addr => dram_wr_addrs(l),
+								  dram_rd_req => dram_rd_reqs(l),
+								  dram_rd_addr => dram_rd_addrs(l),
+								  dram_rd_data => dram_rd_datas(l),
+								  dram_rd_valid => dram_rd_valids(l),
+								  ssd_wr_addr => ssd_wr_addrs(l),
+								  ssd_rd_req => ssd_rd_reqs(l),
+								  ssd_rd_addr => ssd_rd_addrs(l),
+								  ssd_rd_data => ssd_rd_datas(l),
+								  ssd_rd_valid => ssd_rd_valids(l));
 
 						--end generate levelCounter;
 					end generate levelCounterPos;
@@ -415,52 +448,49 @@ architecture Behavioral of fractal is
         end if;
     end process;
 
-    -- HBM arbiter: round-robin across counter instances for HBM writes and reads
-    hbm_arbiter: process(clk)
+    -- Memory arbiter: pass through all tier interfaces from counter instance 1.
+    -- With single instance, no round-robin needed — direct passthrough.
+    -- HBM
+    hbm_wr_en   <= hbm_wr_ens(1);
+    hbm_dout     <= hbm_douts(1);
+    hbm_wr_addr  <= hbm_wr_addrs(1);
+    hbm_rd_req   <= hbm_rd_reqs(1);
+    hbm_rd_addr  <= hbm_rd_addrs(1);
+    -- DRAM
+    dram_wr_en   <= dram_wr_ens(1);
+    dram_dout    <= dram_douts(1);
+    dram_wr_addr <= dram_wr_addrs(1);
+    dram_rd_req  <= dram_rd_reqs(1);
+    dram_rd_addr <= dram_rd_addrs(1);
+    -- SSD
+    ssd_wr_en    <= ssd_wr_ens(1);
+    ssd_dout     <= ssd_douts(1);
+    ssd_wr_addr  <= ssd_wr_addrs(1);
+    ssd_rd_req   <= ssd_rd_reqs(1);
+    ssd_rd_addr  <= ssd_rd_addrs(1);
+
+    -- Broadcast ready/phase1_complete/rd responses to all counter instances
+    mem_broadcast: process(clk)
         constant N_CNTRS : integer := N_FF_LEVELS - N_BASE_LEVELS;
-        variable hbm_turn : integer range 1 to N_FF_LEVELS-N_BASE_LEVELS := 1;
-        variable next_t   : integer range 1 to N_FF_LEVELS-N_BASE_LEVELS;
-        variable found    : boolean;
     begin
         if rising_edge(clk) then
-            hbm_wr_en <= '0';
-            hbm_rd_req <= '0';
-            if hbm_ready = '1' then
-                found := false;
-                for i in 0 to N_CNTRS-1 loop
-                    next_t := 1 + (hbm_turn - 1 + i) mod N_CNTRS;
-                    if not found and hbm_wr_ens(next_t) = '1' then
-                        hbm_dout    <= hbm_douts(next_t);
-                        hbm_wr_en   <= '1';
-                        hbm_wr_addr <= hbm_wr_addrs(next_t);
-                        hbm_turn := 1 + (next_t mod N_CNTRS);
-                        found := true;
-                    elsif not found and hbm_rd_reqs(next_t) = '1' then
-                        hbm_rd_req  <= '1';
-                        hbm_rd_addr <= hbm_rd_addrs(next_t);
-                        hbm_turn := 1 + (next_t mod N_CNTRS);
-                        found := true;
-                    end if;
-                end loop;
-            end if;
-            -- Broadcast ready/phase1_complete/rd signals to all counter instances
             for i in 1 to N_CNTRS loop
-                hbm_readys(i) <= hbm_ready;
-                phase1_completes(i) <= phase1_complete;
-                hbm_rd_datas(i) <= hbm_rd_data;
+                hbm_readys(i)    <= hbm_ready;
+                hbm_rd_datas(i)  <= hbm_rd_data;
                 hbm_rd_valids(i) <= hbm_rd_valid;
+                dram_readys(i)   <= dram_ready;
+                dram_rd_datas(i) <= dram_rd_data;
+                dram_rd_valids(i) <= dram_rd_valid;
+                ssd_readys(i)    <= ssd_ready;
+                ssd_rd_datas(i)  <= ssd_rd_data;
+                ssd_rd_valids(i) <= ssd_rd_valid;
+                phase1_completes(i) <= phase1_complete;
             end loop;
         end if;
     end process;
 
-    -- sort_complete from first counter instance (all instances process same data)
+    -- sort_complete from first counter instance
     sort_complete <= sort_completes(1);
-
-    -- DRAM/SSD interfaces inactive for now
-    dram_wr_en <= '0';
-    dram_dout  <= (others => '0');
-    ssd_wr_en  <= '0';
-    ssd_dout   <= (others => '0');
 
 end Behavioral;
 
