@@ -12,12 +12,6 @@ FractalSort decomposes radix sorting into three modules operating on a fractal t
 
 - **Controller**: Orchestrates two-phase operation. Phase 1 scatters sorted entries into bins drained to tiered memory. Phase 2 reads bins back and re-sorts for final output. A partition-free merge uses O(1) hash lookups (getValue, getIndex) on the compressed histogram, enabling collision-free parallel updates bounded by T_update < O(p).
 
-### Complexity
-
-- **Time**: O(min(p, lambda * log(n)) * log_B(n)), where B >> 2
-- **Space**: O(2(n - 1)) — linear in input size
-- **Histogram**: Bounded size independent of data distribution
-
 ## Simulation
 
 Requires Vivado 2025.1 (xvhdl, xelab, xsim).
