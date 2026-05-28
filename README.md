@@ -4,13 +4,14 @@ FPGA implementation of **FractalSort: High Precision Compressed Radix Sort on FP
 
 ## Algorithm
 
-FractalSort decomposes radix sorting into three modules operating on a fractal tree structure with branching factor $B$:
+FractalSort decomposes radix sorting into three modules operating on a fractal tree structure with branching factor $B$, where $n_b$ = `INPUT_SIZE` is the batch size:
 
-- **Fractal Swap (FS)**: A fractal tree with fanout $B$ (= $N$) and depth $\log_B(n_{\max})$. At level $l$, each FS node processes a sub-problem of size $n / B^l$. Each node contains a *distribution block* (partition by significant bit) and an *aggregation block* (merge sorted results from its $B$ children).
+- **Fractal Swap (FS)**: A fractal tree with fanout $B$ (= $N$) and depth $\log_B(n_b)$. At level $l$, each FS node processes a sub-problem of size $n_b / B^l$. Each node contains distribution (partition by significant bit) and aggregation logic (merge sorted results from its $B$ children).
 
-- **Fractal Filter (FF)**: A binary tree of FF nodes at depth $\min(p, \log_2(n_{\max}))$. Each FF node uses a *Change Detector* to identify significant bits and concatenate only active entries, producing a compressed histogram. The compression ratio averages $C \approx 6.3$ for typical distributions and reaches $C \approx 1.09 \times 10^4$ at high precision ($p = 128$).
+- **Fractal Filter (FF)**: A binary tree of FF nodes at depth $\min(p, \log_2(n_b))$. Each FF node uses a *Change Detector* to identify significant bits and concatenate only active entries, producing a compressed histogram update. This is optional in LSB sorting mode.
 
-- **Controller**: Orchestrates two-phase operation. Phase 1 scatters sorted entries into bins drained to tiered memory. Phase 2 reads bins back and re-sorts for final output. A partition-free merge uses $O(1)$ hash lookups (getValue, getIndex) on the compressed histogram, enabling collision-free parallel updates bounded by $T_{\text{update}} < O(p)$.
+- **Controller**: Orchestrates two-phase operation. Phase 1 scatters compressed leaf entries into merge tree-associated leaf bins drained to tiered memory. Phase 2 loads each leaf bin back to sort the compressed entries, enabling collision-free parallel updates to the bin merge tree.
+
 
 ## Simulation
 
