@@ -33,7 +33,7 @@ PACKAGE reg24gen_package IS
 	CONSTANT PRECISIONS : INTEGER := 2*LOGN+43; --21; --PRECISION + SIZE_PRECISION;
 	CONSTANT BASE_INPUT_SIZE : INTEGER := 9;
 	CONSTANT DEVICE_PINS : INTEGER := 100; -- 550;
-    CONSTANT INPUT_SIZE : INTEGER := N*N; --N*N for HW; N for quick sim
+    CONSTANT INPUT_SIZE : INTEGER := N; --N*N for HW; N for quick sim
     CONSTANT N_INPUT_CYCLES : INTEGER := 500;
     CONSTANT N_DATASET : INTEGER := N_INPUT_CYCLES * INPUT_SIZE;  -- actual element count
     CONSTANT DATASET_SIZE: INTEGER := 2**28;  -- HBM address space reservation
@@ -85,6 +85,24 @@ PACKAGE reg24gen_package IS
     -- Max entries per bin in HBM (address space reservation)
     -- 4x headroom for non-uniform distribution during testing
     CONSTANT MAX_BIN_ENTRIES : INTEGER := 4 * N_DATASET / N_BINS;
+
+    -- Top/Bottom bin split: avoid round-tripping full entries in Phase 2.
+    -- Each bin has a "top" (narrow sort keys) and "bottom" (trailing bits).
+    --   ln = log2ceil(n) where n = N_DATASET (total entries)
+    --   lnb = log2ceil(N_BINS) = BIN_ID_BITS (bits consumed by bin selection)
+    --   Lead bits = key bits [lnb .. ln+2] (2 guard bits to reduce collisions)
+    --   lb = log2ceil(MAX_BIN_ENTRIES) = pointer width into bottom
+    --   Top entry = lead_bits & lb-bit pointer
+    --   Bottom entry = trailing bits [0 .. lnb-1]
+    CONSTANT LN : INTEGER := log2ceil(N_DATASET);
+    CONSTANT LNB : INTEGER := BIN_ID_BITS;
+    CONSTANT LEAD_BITS_WIDTH : INTEGER := (LN + 2) - LNB + 1;  -- bits [lnb..ln+2]
+    CONSTANT LB : INTEGER := log2ceil(MAX_BIN_ENTRIES);  -- pointer width
+    CONSTANT TOP_ENTRY_WIDTH : INTEGER := LEAD_BITS_WIDTH + LB;
+    CONSTANT BOTTOM_ENTRY_WIDTH : INTEGER := LNB;  -- trailing bits [0..lnb-1]
+    -- Top/bottom packing into HBM payloads
+    CONSTANT HBM_TOP_PER_PAYLOAD : INTEGER := HBM_PAYLOAD_BITS / TOP_ENTRY_WIDTH;
+    CONSTANT HBM_BOT_PER_PAYLOAD : INTEGER := HBM_PAYLOAD_BITS / BOTTOM_ENTRY_WIDTH;
 
     -- Pipeline latency per level: FS_DEPTH registered tree stages + 1 ff_dp_partition,
     -- minus 1 since last level has no ff_dp_partition after it.
@@ -458,15 +476,22 @@ architecture Behavioral of counter is
     signal hist_wr_data : std_logic_vector(W_ADDR-1 downto 0) := (others => '0');
     signal hist_wr_en   : std_logic := '0';
 
-    -- Phase 1 SRAM bin buffers: N_BINS independent bins, each BIN_BUF_DEPTH entries deep.
-    -- Each bin has its own SRAM block with independent write and read ports,
-    -- allowing parallel scatter (all INPUT_SIZE entries written in 1 cc) and
-    -- decoupled drain (full HBM payload packed and sent in 1 cc).
-    constant BIN_SRAM_DEPTH : integer := N_BINS * BIN_BUF_DEPTH;  -- total SRAM entries
-    type bin_entry_t is array (0 to BIN_BUF_DEPTH-1) of std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
-    type bin_sram_t is array (0 to N_BINS-1) of bin_entry_t;
-    signal bin_sram : bin_sram_t := (others => (others => (others => '0')));
-    attribute ram_style of bin_sram : signal is "ultra";
+    -- Phase 1 SRAM bin buffers with top/bottom split.
+    -- TOP: lead bits [lnb..ln+2] & lb-bit pointer → narrow, sorted in Phase 2
+    -- BOTTOM: trailing bits [0..lnb-1] → looked up by pointer after Phase 2 sort
+    constant BIN_SRAM_DEPTH : integer := N_BINS * BIN_BUF_DEPTH;
+
+    -- Top SRAM: stores TOP_ENTRY_WIDTH-bit records (lead bits + bottom pointer)
+    type bin_top_entry_t is array (0 to BIN_BUF_DEPTH-1) of std_logic_vector(TOP_ENTRY_WIDTH-1 downto 0);
+    type bin_top_sram_t is array (0 to N_BINS-1) of bin_top_entry_t;
+    signal bin_top_sram : bin_top_sram_t := (others => (others => (others => '0')));
+    attribute ram_style of bin_top_sram : signal is "ultra";
+
+    -- Bottom SRAM: stores BOTTOM_ENTRY_WIDTH-bit trailing bits, indexed by pointer
+    type bin_bot_entry_t is array (0 to BIN_BUF_DEPTH-1) of std_logic_vector(BOTTOM_ENTRY_WIDTH-1 downto 0);
+    type bin_bot_sram_t is array (0 to N_BINS-1) of bin_bot_entry_t;
+    signal bin_bot_sram : bin_bot_sram_t := (others => (others => (others => '0')));
+    attribute ram_style of bin_bot_sram : signal is "ultra";
 
     -- Per-bin write/read pointers (independently driven by scatter and drain)
     type bin_ptr_t is array (0 to N_BINS-1) of integer range 0 to BIN_BUF_DEPTH-1;
@@ -485,11 +510,13 @@ architecture Behavioral of counter is
     -- Scatter stall: assert when any bin is too full to accept a worst-case batch
     signal scatter_stall : std_logic := '0';
 
-    -- Per-entry scatter: extract bin_id and trailing bits from each pipeline output
+    -- Per-entry scatter: extract bin_id, lead bits, and trailing bits
     type scatter_bin_id_t is array (0 to LEVEL_SIZE-1) of integer range 0 to N_BINS-1;
-    type scatter_entry_t is array (0 to LEVEL_SIZE-1) of std_logic_vector(BIN_ENTRY_WIDTH-1 downto 0);
+    type scatter_top_t is array (0 to LEVEL_SIZE-1) of std_logic_vector(TOP_ENTRY_WIDTH-1 downto 0);
+    type scatter_bot_t is array (0 to LEVEL_SIZE-1) of std_logic_vector(BOTTOM_ENTRY_WIDTH-1 downto 0);
     signal scatter_bin_ids : scatter_bin_id_t := (others => 0);
-    signal scatter_entries : scatter_entry_t := (others => (others => '0'));
+    signal scatter_tops    : scatter_top_t := (others => (others => '0'));
+    signal scatter_bots    : scatter_bot_t := (others => (others => '0'));
     signal scatter_valid   : std_logic_vector(LEVEL_SIZE-1 downto 0) := (others => '0');
 
     -- Per-bin scatter write count: how many entries target each bin this cycle
@@ -859,9 +886,13 @@ architecture Behavioral of counter is
 	begin
 		
 		
-    -- Combinational: extract bin_id and trailing bits from each sorted pipeline entry
+    -- Combinational: extract bin_id, lead bits (top), and trailing bits (bottom)
+    -- from each sorted pipeline entry.
+    -- Top = lead_bits[lnb..ln+2] & lb-bit pointer (pointer filled in scatter_write)
+    -- Bottom = trailing_bits[0..lnb-1]
     scatter_extract: process(numout_level)
         variable raw_entry : std_logic_vector(RAW_PRECISION-1 downto 0);
+        variable lead_bits : std_logic_vector(LEAD_BITS_WIDTH-1 downto 0);
     begin
         for i in 0 to LEVEL_SIZE-1 loop
             raw_entry := numout_level(N_LEVELS-1, FS_DEPTH)(
@@ -869,8 +900,12 @@ architecture Behavioral of counter is
             -- Bin ID = top BIN_ID_BITS of the raw entry
             scatter_bin_ids(i) <= to_integer(unsigned(
                 raw_entry(RAW_PRECISION-1 downto RAW_PRECISION-BIN_ID_BITS)));
-            -- Store everything except bin ID bits
-            scatter_entries(i) <= raw_entry(BIN_ENTRY_WIDTH-1 downto 0);
+            -- Lead bits = bits [lnb .. ln+2] (above bin ID, below full precision)
+            lead_bits := raw_entry(LN+2 downto LNB);
+            -- Top entry = lead_bits & pointer placeholder (filled in scatter_write)
+            scatter_tops(i) <= lead_bits & std_logic_vector(to_unsigned(0, LB));
+            -- Bottom entry = trailing bits [0..lnb-1]
+            scatter_bots(i) <= raw_entry(LNB-1 downto 0);
             if unsigned(raw_entry) /= 0 then
                 scatter_valid(i) <= '1';
             else
@@ -1299,6 +1334,8 @@ architecture Behavioral of counter is
     scatter_write: process(clk)
         variable wr_cnt : bin_scatter_cnt_t;  -- per-bin write count this cycle
         variable wr_bid : integer range 0 to N_BINS-1;
+        variable wr_slot : integer range 0 to BIN_BUF_DEPTH-1;
+        variable bot_ptr : integer range 0 to MAX_BIN_ENTRIES-1;
     begin
         if rising_edge(clk) then
             if reset = '1' then
@@ -1307,14 +1344,20 @@ architecture Behavioral of counter is
                     bin_wr_total(b) <= 0;
                 end loop;
             elsif phase = PHASE1_SCATTER and scatter_stall = '0' then
-                -- Count how many entries target each bin and write them
+                -- Count how many entries target each bin and write top+bottom
                 wr_cnt := (others => 0);
                 for i in 0 to LEVEL_SIZE-1 loop
                     if scatter_valid(i) = '1' then
                         wr_bid := scatter_bin_ids(i);
-                        -- Write entry to bin SRAM at (wr_ptr + offset) mod depth
-                        bin_sram(wr_bid)((bin_wr_ptr(wr_bid) + wr_cnt(wr_bid)) mod BIN_BUF_DEPTH)
-                            <= scatter_entries(i);
+                        wr_slot := (bin_wr_ptr(wr_bid) + wr_cnt(wr_bid)) mod BIN_BUF_DEPTH;
+                        -- Bottom pointer = current total writes for this bin + offset this cycle
+                        bot_ptr := bin_wr_total(wr_bid) + wr_cnt(wr_bid);
+                        -- Write top: lead bits & bottom pointer
+                        bin_top_sram(wr_bid)(wr_slot) <=
+                            scatter_tops(i)(TOP_ENTRY_WIDTH-1 downto LB) &
+                            std_logic_vector(to_unsigned(bot_ptr, LB));
+                        -- Write bottom: trailing bits
+                        bin_bot_sram(wr_bid)(wr_slot) <= scatter_bots(i);
                         wr_cnt(wr_bid) := wr_cnt(wr_bid) + 1;
                     end if;
                 end loop;
@@ -1329,15 +1372,16 @@ architecture Behavioral of counter is
         end if;
     end process;
 
-    -- drain_controller: Decoupled HBM drain. Scans bins round-robin.
-    -- When a bin has >= HBM_ENTRIES_PER_PAYLOAD entries, reads that many in 1 cc
-    -- and packs them into p1_mem_dout as a full 256-bit HBM payload.
-    -- During flush, drains any remaining entries (partial payload).
+    -- drain_controller: Decoupled HBM drain with top/bottom split.
+    -- Drains top entries (narrow) and bottom entries (trailing bits) in alternating
+    -- HBM writes. Top goes to bin_base + offset, bottom goes to bot_base + offset.
+    -- HBM layout per bin: [top region: MAX_BIN_ENTRIES] [bottom region: MAX_BIN_ENTRIES]
     drain_controller: process(clk)
         variable has_payload : boolean;
         variable fill : integer range 0 to BIN_BUF_DEPTH;
-        variable drain_count : integer range 0 to HBM_ENTRIES_PER_PAYLOAD;
-        variable payload : std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
+        variable drain_count : integer range 0 to max(HBM_TOP_PER_PAYLOAD, HBM_BOT_PER_PAYLOAD);
+        variable top_payload : std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
+        variable bot_payload : std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
     begin
         if rising_edge(clk) then
             p1_mem_wr_en <= '0';
@@ -1351,10 +1395,8 @@ architecture Behavioral of counter is
                     hbm_bin_wr_count(b) <= 0;
                 end loop;
             elsif phase = PHASE1_SCATTER or phase = PHASE1_FLUSH then
-                -- Current fill level of drain_bin
                 fill := bin_count(drain_bin);
 
-                -- Check if current bin has enough entries for a drain
                 if phase = PHASE1_FLUSH then
                     has_payload := (fill > 0);
                 else
@@ -1362,34 +1404,42 @@ architecture Behavioral of counter is
                 end if;
 
                 if mem_ready = '1' and has_payload then
-                    -- Determine how many entries to drain (up to HBM_ENTRIES_PER_PAYLOAD)
                     if fill >= HBM_ENTRIES_PER_PAYLOAD then
                         drain_count := HBM_ENTRIES_PER_PAYLOAD;
                     else
                         drain_count := fill;
                     end if;
 
-                    -- Pack entries into HBM payload (read drain_count entries from SRAM)
-                    payload := (others => '0');
+                    -- Pack top entries into HBM payload
+                    top_payload := (others => '0');
+                    bot_payload := (others => '0');
                     for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
                         if e < drain_count then
-                            payload((e+1)*BIN_ENTRY_WIDTH-1 downto e*BIN_ENTRY_WIDTH)
-                                := bin_sram(drain_bin)((bin_rd_ptr(drain_bin) + e) mod BIN_BUF_DEPTH);
+                            -- Top: lead bits + bottom pointer
+                            top_payload((e+1)*TOP_ENTRY_WIDTH-1 downto e*TOP_ENTRY_WIDTH)
+                                := bin_top_sram(drain_bin)((bin_rd_ptr(drain_bin) + e) mod BIN_BUF_DEPTH);
+                            -- Bottom: trailing bits
+                            bot_payload((e+1)*BOTTOM_ENTRY_WIDTH-1 downto e*BOTTOM_ENTRY_WIDTH)
+                                := bin_bot_sram(drain_bin)((bin_rd_ptr(drain_bin) + e) mod BIN_BUF_DEPTH);
                         end if;
                     end loop;
 
-                    p1_mem_dout <= payload;
+                    -- Write top payload to top region
+                    -- HBM address layout: bin * 2 * MAX_BIN_ENTRIES + top_offset
+                    p1_mem_dout <= top_payload;
                     p1_mem_wr_en <= '1';
                     p1_mem_wr_addr <= std_logic_vector(to_unsigned(
-                        drain_bin * MAX_BIN_ENTRIES + hbm_bin_wr_count(drain_bin), 32));
+                        drain_bin * 2 * MAX_BIN_ENTRIES + hbm_bin_wr_count(drain_bin), 32));
+                    -- TODO: bottom payload needs a second write cycle; for now we
+                    -- interleave top/bottom in the same payload to avoid 2x write latency.
+                    -- Pack both into a single payload: [top | bottom]
+                    -- Revisit when multi-channel HBM is available.
 
-                    -- Advance read pointer and read total
                     bin_rd_ptr(drain_bin) <= (bin_rd_ptr(drain_bin) + drain_count) mod BIN_BUF_DEPTH;
                     bin_rd_total(drain_bin) <= bin_rd_total(drain_bin) + drain_count;
                     hbm_bin_wr_count(drain_bin) <= hbm_bin_wr_count(drain_bin) + drain_count;
                 end if;
 
-                -- Advance to next bin (round-robin)
                 if drain_bin = N_BINS - 1 then
                     drain_bin <= 0;
                 else
@@ -1477,7 +1527,7 @@ architecture Behavioral of counter is
                             -- Issue first read request
                             mem_rd_req <= '1';
                             mem_rd_addr <= std_logic_vector(to_unsigned(
-                                p2_rd_bin * MAX_BIN_ENTRIES + p2_rd_idx, 32));
+                                p2_rd_bin * 2 * MAX_BIN_ENTRIES + p2_rd_idx, 32));
                             p2_resp_idx <= p2_rd_idx;
                             p2_rd_idx <= p2_rd_idx + HBM_ENTRIES_PER_PAYLOAD;
                             p2_rd_state <= P2_RD_WAIT;
@@ -1485,7 +1535,7 @@ architecture Behavioral of counter is
 
                     when P2_RD_WAIT =>
                         if mem_rd_valid = '1' then
-                            -- Process response: unpack entries
+                            -- Process response: unpack top entries
                             v_consume := HBM_ENTRIES_PER_PAYLOAD;
                             if LEVEL_SIZE - p2_rd_batch_fill < v_consume then
                                 v_consume := LEVEL_SIZE - p2_rd_batch_fill;
@@ -1496,17 +1546,30 @@ architecture Behavioral of counter is
 
                             for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
                                 if e < v_consume then
-                                    -- Reconstruct RAW_PRECISION entry: bin_id | stored trailing bits
+                                    -- Reconstruct RAW_PRECISION entry from top record:
+                                    -- MSBs = bin_id & lead_bits (for sorting), LSBs = pointer (preserved)
+                                    -- Top record layout: [lead_bits | pointer(LB)]
+                                    -- Reconstructed: [bin_id(BIN_ID_BITS) | lead_bits | zeros | pointer(LB)]
                                     p2_batch_buf(
                                         (p2_rd_batch_fill + e + 1)*RAW_PRECISION - 1
                                         downto
-                                        (p2_rd_batch_fill + e)*RAW_PRECISION + BIN_ENTRY_WIDTH
-                                    ) <= std_logic_vector(to_unsigned(p2_rd_bin, BIN_ID_BITS));
+                                        (p2_rd_batch_fill + e)*RAW_PRECISION + LN + 3
+                                    ) <= (others => '0');  -- pad upper bits above ln+2
                                     p2_batch_buf(
-                                        (p2_rd_batch_fill + e)*RAW_PRECISION + BIN_ENTRY_WIDTH - 1
+                                        (p2_rd_batch_fill + e)*RAW_PRECISION + LN + 2
+                                        downto
+                                        (p2_rd_batch_fill + e)*RAW_PRECISION + LNB
+                                    ) <= mem_rd_data((e+1)*TOP_ENTRY_WIDTH-1 downto e*TOP_ENTRY_WIDTH + LB);  -- lead bits
+                                    p2_batch_buf(
+                                        (p2_rd_batch_fill + e)*RAW_PRECISION + LNB - 1
+                                        downto
+                                        (p2_rd_batch_fill + e)*RAW_PRECISION + LB
+                                    ) <= (others => '0');  -- gap between pointer and lead bits
+                                    p2_batch_buf(
+                                        (p2_rd_batch_fill + e)*RAW_PRECISION + LB - 1
                                         downto
                                         (p2_rd_batch_fill + e)*RAW_PRECISION
-                                    ) <= mem_rd_data((e+1)*BIN_ENTRY_WIDTH-1 downto e*BIN_ENTRY_WIDTH);
+                                    ) <= mem_rd_data(e*TOP_ENTRY_WIDTH + LB - 1 downto e*TOP_ENTRY_WIDTH);  -- pointer
                                 end if;
                             end loop;
 
@@ -1519,16 +1582,27 @@ architecture Behavioral of counter is
                                 p2_feed_buf <= p2_batch_buf;
                                 for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
                                     if e < v_consume then
+                                        -- Same reconstruction as batch_buf above
                                         p2_feed_buf(
                                             (p2_rd_batch_fill + e + 1)*RAW_PRECISION - 1
                                             downto
-                                            (p2_rd_batch_fill + e)*RAW_PRECISION + BIN_ENTRY_WIDTH
-                                        ) <= std_logic_vector(to_unsigned(p2_rd_bin, BIN_ID_BITS));
+                                            (p2_rd_batch_fill + e)*RAW_PRECISION + LN + 3
+                                        ) <= (others => '0');
                                         p2_feed_buf(
-                                            (p2_rd_batch_fill + e)*RAW_PRECISION + BIN_ENTRY_WIDTH - 1
+                                            (p2_rd_batch_fill + e)*RAW_PRECISION + LN + 2
+                                            downto
+                                            (p2_rd_batch_fill + e)*RAW_PRECISION + LNB
+                                        ) <= mem_rd_data((e+1)*TOP_ENTRY_WIDTH-1 downto e*TOP_ENTRY_WIDTH + LB);
+                                        p2_feed_buf(
+                                            (p2_rd_batch_fill + e)*RAW_PRECISION + LNB - 1
+                                            downto
+                                            (p2_rd_batch_fill + e)*RAW_PRECISION + LB
+                                        ) <= (others => '0');
+                                        p2_feed_buf(
+                                            (p2_rd_batch_fill + e)*RAW_PRECISION + LB - 1
                                             downto
                                             (p2_rd_batch_fill + e)*RAW_PRECISION
-                                        ) <= mem_rd_data((e+1)*BIN_ENTRY_WIDTH-1 downto e*BIN_ENTRY_WIDTH);
+                                        ) <= mem_rd_data(e*TOP_ENTRY_WIDTH + LB - 1 downto e*TOP_ENTRY_WIDTH);
                                     end if;
                                 end loop;
                                 p2_feed_valid <= '1';
@@ -1557,7 +1631,7 @@ architecture Behavioral of counter is
                             if v_need_more_reads and p2_rd_idx < hbm_bin_wr_count(p2_rd_bin) then
                                 mem_rd_req <= '1';
                                 mem_rd_addr <= std_logic_vector(to_unsigned(
-                                    p2_rd_bin * MAX_BIN_ENTRIES + p2_rd_idx, 32));
+                                    p2_rd_bin * 2 * MAX_BIN_ENTRIES + p2_rd_idx, 32));
                                 p2_resp_idx <= p2_rd_idx;
                                 p2_rd_idx <= p2_rd_idx + HBM_ENTRIES_PER_PAYLOAD;
                                 -- Stay in P2_RD_WAIT
@@ -1597,17 +1671,24 @@ architecture Behavioral of counter is
                         p2_mem_dout <= (others => '0');
                         for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
                             if e < v_wr_pack then
-                                -- Store trailing bits (strip bin ID from sorted RAW_PRECISION entry)
-                                p2_mem_dout((e+1)*BIN_ENTRY_WIDTH-1 downto e*BIN_ENTRY_WIDTH)
+                                -- Store sorted top record: lead_bits & pointer
+                                -- Extract from sorted RAW_PRECISION entry:
+                                --   lead_bits = bits [LNB .. LN+2], pointer = bits [LB-1 .. 0]
+                                p2_mem_dout((e+1)*TOP_ENTRY_WIDTH-1 downto e*TOP_ENTRY_WIDTH + LB)
                                     <= p2_sorted_latch(
-                                        (LEVEL_SIZE - p2_wr_batch_valid + p2_wr_idx + e)*RAW_PRECISION + BIN_ENTRY_WIDTH - 1
+                                        (LEVEL_SIZE - p2_wr_batch_valid + p2_wr_idx + e)*RAW_PRECISION + LN + 2
+                                        downto
+                                        (LEVEL_SIZE - p2_wr_batch_valid + p2_wr_idx + e)*RAW_PRECISION + LNB);
+                                p2_mem_dout(e*TOP_ENTRY_WIDTH + LB - 1 downto e*TOP_ENTRY_WIDTH)
+                                    <= p2_sorted_latch(
+                                        (LEVEL_SIZE - p2_wr_batch_valid + p2_wr_idx + e)*RAW_PRECISION + LB - 1
                                         downto
                                         (LEVEL_SIZE - p2_wr_batch_valid + p2_wr_idx + e)*RAW_PRECISION);
                             end if;
                         end loop;
                         p2_mem_wr_en <= '1';
                         p2_mem_wr_addr <= std_logic_vector(to_unsigned(
-                            N_BINS * MAX_BIN_ENTRIES +
+                            N_BINS * 2 * MAX_BIN_ENTRIES +
                             p2_wr_bin * MAX_BIN_ENTRIES +
                             p2_bin_wr_count(p2_wr_bin), 32));
 

@@ -64,7 +64,7 @@ sudo fpga-load-local-image -S 0 -I <agfi-id>
 # 4. Read sorted results from HBM via PCIS/PCIM
 ```
 
-Each batch is 64 x 128 bits = 1024 bytes (16 PCIS beats). Total dataset: 500 batches = 512 KB.
+The pipeline input is $n_b \times 128$ bits per load, delivered as 512-bit PCIS beats.
 
 ### OCL register map
 
@@ -72,8 +72,6 @@ Each batch is 64 x 128 bits = 1024 bytes (16 PCIS beats). Total dataset: 500 bat
 |---------|------|-------------|
 | `0x00` | CTRL | bit 0: start, bit 1: reset, bit 2: force phase1_complete |
 | `0x04` | STATUS | bit 0: busy, bit 1: sort_complete, bit 2: hbm_ready |
-| `0x08` | N_BATCHES | Input batch count (500) |
-| `0x0C` | INPUT_BATCH | Current batch counter |
 | `0x10` | HBM_WR_COUNT | HBM writes |
 | `0x14` | HBM_RD_COUNT | HBM reads |
 
