@@ -74,6 +74,8 @@ architecture Behavioral of tb_fractal is
     signal hbm_rd_total_bits : integer := 0;
     signal dram_wr_count : integer := 0;
     signal dram_total_bits : integer := 0;
+    signal ssd_wr_count : integer := 0;
+    signal ssd_total_bits : integer := 0;
 
     -- Simulated memory (stores Phase 1 drain, serves Phase 2 reads)
     -- All three tiers share the same sim memory model (same address space).
@@ -361,6 +363,8 @@ begin
     begin
         if rising_edge(clk) then
             if ssd_wr_en = '1' then
+                ssd_wr_count <= ssd_wr_count + 1;
+                ssd_total_bits <= ssd_total_bits + HBM_PAYLOAD_BITS;
                 base_addr := to_integer(unsigned(ssd_wr_addr));
                 for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
                     entry := ssd_dout((e+1)*BIN_ENTRY_WIDTH-1 downto e*BIN_ENTRY_WIDTH);
@@ -448,16 +452,20 @@ begin
             integer'image(dram_total_bits) & " bits (" &
             integer'image(dram_total_bits / 8) & " bytes)"));
         writeline(output, l);
+        write(l, string'("SSD write:  " & integer'image(ssd_wr_count) & " ops, " &
+            integer'image(ssd_total_bits) & " bits (" &
+            integer'image(ssd_total_bits / 8) & " bytes)"));
+        writeline(output, l);
         if cycle > 0 then
             write(l, string'("Avg bits/cc:  HBM_wr=" & integer'image(hbm_total_bits / cycle) &
                 "  HBM_rd=" & integer'image(hbm_rd_total_bits / cycle) &
-                "  DRAM_wr=" & integer'image(dram_total_bits / cycle)));
+                "  DRAM_wr=" & integer'image(dram_total_bits / cycle) &
+                "  SSD_wr=" & integer'image(ssd_total_bits / cycle)));
             writeline(output, l);
-            -- MB/s at 100 MHz: bits_total / cycle = bits/cc, × 100M cc/s / 8M bits/MB = × 12.5
-            -- Use integer math: MB/s = bits_total * 100 / cycle / 8
             write(l, string'("Avg MB/s @100MHz:  HBM_wr=" & integer'image(hbm_total_bits * 100 / cycle / 8) &
                 "  HBM_rd=" & integer'image(hbm_rd_total_bits * 100 / cycle / 8) &
-                "  DRAM_wr=" & integer'image(dram_total_bits * 100 / cycle / 8)));
+                "  DRAM_wr=" & integer'image(dram_total_bits * 100 / cycle / 8) &
+                "  SSD_wr=" & integer'image(ssd_total_bits * 100 / cycle / 8)));
             writeline(output, l);
         end if;
         wait;

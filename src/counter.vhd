@@ -1372,16 +1372,15 @@ architecture Behavioral of counter is
         end if;
     end process;
 
-    -- drain_controller: Decoupled HBM drain with top/bottom split.
-    -- Drains top entries (narrow) and bottom entries (trailing bits) in alternating
-    -- HBM writes. Top goes to bin_base + offset, bottom goes to bot_base + offset.
+    -- drain_controller: Two-cycle HBM drain with top/bottom split.
+    -- Cycle 1 (drain_active='0'): write top payload (lead bits + pointer)
+    -- Cycle 2 (drain_active='1'): write bottom payload (trailing bits)
     -- HBM layout per bin: [top region: MAX_BIN_ENTRIES] [bottom region: MAX_BIN_ENTRIES]
     drain_controller: process(clk)
         variable has_payload : boolean;
         variable fill : integer range 0 to BIN_BUF_DEPTH;
-        variable drain_count : integer range 0 to max(HBM_TOP_PER_PAYLOAD, HBM_BOT_PER_PAYLOAD);
-        variable top_payload : std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
-        variable bot_payload : std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
+        variable drain_count : integer range 0 to HBM_ENTRIES_PER_PAYLOAD;
+        variable payload : std_logic_vector(HBM_PAYLOAD_BITS-1 downto 0);
     begin
         if rising_edge(clk) then
             p1_mem_wr_en <= '0';
@@ -1395,55 +1394,81 @@ architecture Behavioral of counter is
                     hbm_bin_wr_count(b) <= 0;
                 end loop;
             elsif phase = PHASE1_SCATTER or phase = PHASE1_FLUSH then
-                fill := bin_count(drain_bin);
 
-                if phase = PHASE1_FLUSH then
-                    has_payload := (fill > 0);
+                if drain_active = '1' then
+                    -- Cycle 2: write bottom payload for the same drain_bin
+                    if mem_ready = '1' then
+                        payload := (others => '0');
+                        for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
+                            if e < drain_sub_idx then
+                                payload((e+1)*BOTTOM_ENTRY_WIDTH-1 downto e*BOTTOM_ENTRY_WIDTH)
+                                    := bin_bot_sram(drain_bin)(
+                                        (bin_rd_ptr(drain_bin) - drain_sub_idx + e) mod BIN_BUF_DEPTH);
+                            end if;
+                        end loop;
+                        p1_mem_dout <= payload;
+                        p1_mem_wr_en <= '1';
+                        -- Bottom region starts at bin * 2 * MAX_BIN_ENTRIES + MAX_BIN_ENTRIES
+                        p1_mem_wr_addr <= std_logic_vector(to_unsigned(
+                            drain_bin * 2 * MAX_BIN_ENTRIES + MAX_BIN_ENTRIES +
+                            hbm_bin_wr_count(drain_bin) - drain_sub_idx, 32));
+
+                        drain_active <= '0';
+                        -- Advance to next bin
+                        if drain_bin = N_BINS - 1 then
+                            drain_bin <= 0;
+                        else
+                            drain_bin <= drain_bin + 1;
+                        end if;
+                    end if;
                 else
-                    has_payload := (fill >= HBM_ENTRIES_PER_PAYLOAD);
-                end if;
+                    -- Cycle 1: check bin fill and write top payload
+                    fill := bin_count(drain_bin);
 
-                if mem_ready = '1' and has_payload then
-                    if fill >= HBM_ENTRIES_PER_PAYLOAD then
-                        drain_count := HBM_ENTRIES_PER_PAYLOAD;
+                    if phase = PHASE1_FLUSH then
+                        has_payload := (fill > 0);
                     else
-                        drain_count := fill;
+                        has_payload := (fill >= HBM_ENTRIES_PER_PAYLOAD);
                     end if;
 
-                    -- Pack top entries into HBM payload
-                    top_payload := (others => '0');
-                    bot_payload := (others => '0');
-                    for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
-                        if e < drain_count then
-                            -- Top: lead bits + bottom pointer
-                            top_payload((e+1)*TOP_ENTRY_WIDTH-1 downto e*TOP_ENTRY_WIDTH)
-                                := bin_top_sram(drain_bin)((bin_rd_ptr(drain_bin) + e) mod BIN_BUF_DEPTH);
-                            -- Bottom: trailing bits
-                            bot_payload((e+1)*BOTTOM_ENTRY_WIDTH-1 downto e*BOTTOM_ENTRY_WIDTH)
-                                := bin_bot_sram(drain_bin)((bin_rd_ptr(drain_bin) + e) mod BIN_BUF_DEPTH);
+                    if mem_ready = '1' and has_payload then
+                        if fill >= HBM_ENTRIES_PER_PAYLOAD then
+                            drain_count := HBM_ENTRIES_PER_PAYLOAD;
+                        else
+                            drain_count := fill;
                         end if;
-                    end loop;
 
-                    -- Write top payload to top region
-                    -- HBM address layout: bin * 2 * MAX_BIN_ENTRIES + top_offset
-                    p1_mem_dout <= top_payload;
-                    p1_mem_wr_en <= '1';
-                    p1_mem_wr_addr <= std_logic_vector(to_unsigned(
-                        drain_bin * 2 * MAX_BIN_ENTRIES + hbm_bin_wr_count(drain_bin), 32));
-                    -- TODO: bottom payload needs a second write cycle; for now we
-                    -- interleave top/bottom in the same payload to avoid 2x write latency.
-                    -- Pack both into a single payload: [top | bottom]
-                    -- Revisit when multi-channel HBM is available.
+                        -- Pack and write top payload
+                        payload := (others => '0');
+                        for e in 0 to HBM_ENTRIES_PER_PAYLOAD-1 loop
+                            if e < drain_count then
+                                payload((e+1)*TOP_ENTRY_WIDTH-1 downto e*TOP_ENTRY_WIDTH)
+                                    := bin_top_sram(drain_bin)(
+                                        (bin_rd_ptr(drain_bin) + e) mod BIN_BUF_DEPTH);
+                            end if;
+                        end loop;
+                        p1_mem_dout <= payload;
+                        p1_mem_wr_en <= '1';
+                        -- Top region at bin * 2 * MAX_BIN_ENTRIES
+                        p1_mem_wr_addr <= std_logic_vector(to_unsigned(
+                            drain_bin * 2 * MAX_BIN_ENTRIES + hbm_bin_wr_count(drain_bin), 32));
 
-                    bin_rd_ptr(drain_bin) <= (bin_rd_ptr(drain_bin) + drain_count) mod BIN_BUF_DEPTH;
-                    bin_rd_total(drain_bin) <= bin_rd_total(drain_bin) + drain_count;
-                    hbm_bin_wr_count(drain_bin) <= hbm_bin_wr_count(drain_bin) + drain_count;
-                end if;
+                        -- Advance pointers
+                        bin_rd_ptr(drain_bin) <= (bin_rd_ptr(drain_bin) + drain_count) mod BIN_BUF_DEPTH;
+                        bin_rd_total(drain_bin) <= bin_rd_total(drain_bin) + drain_count;
+                        hbm_bin_wr_count(drain_bin) <= hbm_bin_wr_count(drain_bin) + drain_count;
 
-                if drain_bin = N_BINS - 1 then
-                    drain_bin <= 0;
-                else
-                    drain_bin <= drain_bin + 1;
+                        -- Move to cycle 2 for bottom write
+                        drain_active <= '1';
+                        drain_sub_idx <= drain_count;
+                    else
+                        -- Nothing to drain, advance to next bin
+                        if drain_bin = N_BINS - 1 then
+                            drain_bin <= 0;
+                        else
+                            drain_bin <= drain_bin + 1;
+                        end if;
+                    end if;
                 end if;
             end if;
         end if;
