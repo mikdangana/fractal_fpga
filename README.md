@@ -100,4 +100,4 @@ Auto-selected by dataset size: HBM (<=16 GB), DRAM (<=64 GB), SSD (>64 GB). Over
 
 ## Citation
 
-M. Dang'ana and H.-A. Jacobsen, "FractalSort: High Precision Compressed Radix Sort on FPGA," University of Toronto.
+M. Dang'ana and H.-A. Jacobsen, "[FractalSort: High Precision Compressed Radix Sort on FPGA](https://ieeexplore.ieee.org/document/11348110/)," University of Toronto.
