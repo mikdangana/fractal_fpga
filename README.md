@@ -6,7 +6,7 @@ FPGA implementation of **FractalSort: High Precision Compressed Radix Sort on FP
 
 FractalSort decomposes radix sorting into three modules operating on a fractal tree structure with branching factor B:
 
-- **Fractal Swap (FS)**: A hierarchy of FS nodes at depth log_B(n_max). Each node contains a *distribution block* (stable partition by key bit) and an *aggregation block* (merge sorted sub-results). FS performs LSD radix sort — one key bit per precision level — achieving in-place sorted output with O(n) work per level.
+- **Fractal Swap (FS)**: A fractal tree of FS nodes with fanout B (= N), at depth log_B(n_max). Each node contains a *distribution block* (stable partition by significant bit) and an *aggregation block* (merge sorted sub-results from B children). The tree structure enables parallel processing across branches, sorting n entries through recursive decomposition into B sub-problems of size n/B.
 
 - **Fractal Filter (FF)**: A binary tree of FF nodes at depth min(p, log_2(n_max)). Each FF node uses a *Change Detector* to identify significant bits and concatenate only active entries, producing a compressed histogram. The compression ratio averages C ~ 6.3 for typical distributions and reaches C ~ 1.09 x 10^4 at high precision (p=128).
 
