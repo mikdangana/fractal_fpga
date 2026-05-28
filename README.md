@@ -18,17 +18,17 @@ Requires Vivado 2025.1 (xvhdl, xelab, xsim).
 
 ### Quick sim (INPUT_SIZE=8, < 1 GB RAM)
 
-Set `INPUT_SIZE := N` in counter.vhd line 36, then:
+Set `INPUT_SIZE := N` in src/counter.vhd line 36, then:
 
 ```bash
-xvhdl --2008 counter.vhd fractal.vhd tb_fractal.vhd && \
+xvhdl --2008 src/counter.vhd src/fractal.vhd src/tb_fractal.vhd && \
 xelab work.tb_fractal -debug off -s tb_fractal_sim && \
 xsim tb_fractal_sim -runall --log sim_output.txt
 ```
 
 ### Full sim (INPUT_SIZE=64, ~16 GB RAM)
 
-Set `INPUT_SIZE := N*N` in counter.vhd line 36, then run the same command above.
+Set `INPUT_SIZE := N*N` in src/counter.vhd line 36, then run the same command above.
 
 A successful run prints `Phase 2 COMPLETED` with no sort-order errors.
 
@@ -40,7 +40,7 @@ Target: Xilinx VU47P on AWS F2 (f2.12xlarge) with HBM2.
 
 ```bash
 cd ~/src/aws-fpga && source hdk_setup.sh && \
-export CL_DIR=$PWD/../fractal_fpga/cl_fractal && \
+export CL_DIR=$PWD/../fractal_fpga/src/cl_fractal && \
 cd $CL_DIR/build/scripts && \
 $HDK_DIR/cl/examples/cl_dram_hbm_dma/build/scripts/aws_build_dcp_from_cl.py \
   --cl cl_fractal --clock_recipe_a A0 --clock_recipe_b B0 --clock_recipe_hbm H0 && \
@@ -78,19 +78,20 @@ Each batch is 64 x 128 bits = 1024 bytes (16 PCIS beats). Total dataset: 500 bat
 
 ### Tiered storage
 
-Auto-selected by dataset size: HBM (<=16 GB), DRAM (<=64 GB), SSD (>64 GB). Override with `FORCE_TIER` in counter.vhd.
+Auto-selected by dataset size: HBM (<=16 GB), DRAM (<=64 GB), SSD (>64 GB). Override with `FORCE_TIER` in src/counter.vhd.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `counter.vhd` | Sort pipeline, histogram, bin controller, tiered memory routing |
-| `fractal.vhd` | Top-level wrapper |
-| `tb_fractal.vhd` | Testbench with simulated memory and correctness checking |
-| `cl_fractal/design/cl_fractal.sv` | AWS F2 CL wrapper: OCL, PCIS DMA, HBM AXI4 bridge |
-| `cl_fractal/design/cl_fractal_pkg.sv` | AXI bus interfaces |
-| `cl_fractal/design/cl_fractal_defines.vh` | OCL register map, AXI defaults |
-| `cl_fractal/build/scripts/synth_cl_fractal.tcl` | Vivado synthesis script |
+| `src/counter.vhd` | Sort pipeline, histogram, bin controller, tiered memory routing |
+| `src/fractal.vhd` | Top-level wrapper |
+| `src/tb_fractal.vhd` | Testbench with simulated memory and correctness checking |
+| `src/run_synth.tcl` | Standalone Vivado synthesis script |
+| `src/cl_fractal/design/cl_fractal.sv` | AWS F2 CL wrapper: OCL, PCIS DMA, HBM AXI4 bridge |
+| `src/cl_fractal/design/cl_fractal_pkg.sv` | AXI bus interfaces |
+| `src/cl_fractal/design/cl_fractal_defines.vh` | OCL register map, AXI defaults |
+| `src/cl_fractal/build/scripts/synth_cl_fractal.tcl` | Vivado synthesis script for F2 build |
 
 ## Citation
 

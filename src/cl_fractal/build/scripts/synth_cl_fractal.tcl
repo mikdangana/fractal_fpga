@@ -14,8 +14,8 @@ read_verilog -sv [list \
 
 # Read VHDL sources (fractal sort pipeline)
 read_vhdl -vhdl2008 [list \
-  ${CL_DIR}/../../counter.vhd \
-  ${CL_DIR}/../../fractal.vhd
+  ${CL_DIR}/../counter.vhd \
+  ${CL_DIR}/../fractal.vhd
 ]
 
 # Read CL top-level and defines
